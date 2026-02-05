@@ -25,6 +25,9 @@ models/
 logs/
 *.log
 
+# Transcripts (auto-generated daily)
+transcripts/
+
 # Secrets
 .env
 *.token

@@ -13,6 +13,9 @@ This extends Pipecat's AIService:
 
 import asyncio
 import json
+import time
+from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 from loguru import logger
@@ -35,6 +38,9 @@ DEFAULT_VOICE_HINT = (
     "Write naturally for speech: contractions, casual phrasing, no markdown/formatting/lists. "
     "Talk like a real person would. Your response will be spoken aloud via TTS.]\n\n"
 )
+
+# Transcript output directory (daily files: voice-YYYY-MM-DD.md)
+TRANSCRIPT_DIR = Path("/home/anna/clawd/voice-pipeline/v2/transcripts")
 
 
 class ClawdbotLLMService(AIService):
@@ -92,6 +98,46 @@ class ClawdbotLLMService(AIService):
         finally:
             await self.push_frame(LLMFullResponseEndFrame())
 
+    def _log_transcript(
+        self, user_text: str, response_text: str, think_seconds: float
+    ) -> None:
+        """Append an exchange to the daily transcript file.
+
+        Format matches v1 transcripts:
+            ### HH:MM:SS
+            **Anna (voice):** user text
+
+            **Claude (voice):** response text
+
+            _Think: 4.9s_
+        """
+        try:
+            TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+            now = datetime.now()
+            filepath = TRANSCRIPT_DIR / f"voice-{now.strftime('%Y-%m-%d')}.md"
+
+            # Create header on first entry of the day
+            if not filepath.exists():
+                header = (
+                    f"# Voice Transcripts — {now.strftime('%Y-%m-%d')}\n\n"
+                    "Auto-logged by voice_bot_v2 (ClawdbotLLMService).\n\n"
+                )
+                filepath.write_text(header)
+
+            entry = (
+                f"### {now.strftime('%H:%M:%S')}\n"
+                f"**Anna (voice):** {user_text}\n\n"
+                f"**Claude (voice):** {response_text}\n\n"
+                f"_Think: {think_seconds:.1f}s_\n\n"
+            )
+
+            with open(filepath, "a") as f:
+                f.write(entry)
+
+            logger.debug(f"Transcript logged to {filepath.name}")
+        except Exception as e:
+            logger.warning(f"Failed to log transcript: {e}")
+
     async def _run_clawdbot(self, prompt: str) -> None:
         """Run clawdbot agent and parse response as LLMTextFrame."""
         cmd = [
@@ -106,6 +152,8 @@ class ClawdbotLLMService(AIService):
 
         logger.debug(f"Running: clawdbot agent --session-id {self._session_id}")
 
+        t_start = time.monotonic()
+
         self._current_process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -117,6 +165,8 @@ class ClawdbotLLMService(AIService):
                 self._current_process.communicate(),
                 timeout=self._timeout + 10,
             )
+
+            think_seconds = time.monotonic() - t_start
 
             output = stdout.decode().strip()
             if stderr:
@@ -135,6 +185,7 @@ class ClawdbotLLMService(AIService):
             except json.JSONDecodeError:
                 logger.debug(f"Clawdbot non-JSON output: {output[:200]}")
                 await self.push_frame(LLMTextFrame(output))
+                self._log_transcript(prompt, output, think_seconds)
                 return
 
             status = data.get("status", "")
@@ -147,15 +198,20 @@ class ClawdbotLLMService(AIService):
 
             # Extract text from payloads
             payloads = data.get("result", {}).get("payloads", [])
+            response_parts = []
             got_content = False
             for payload in payloads:
                 text = payload.get("text", "")
                 if text:
                     got_content = True
+                    response_parts.append(text)
                     logger.info(f"ClawdbotLLM response: {text[:80]}...")
                     await self.push_frame(LLMTextFrame(text))
 
-            if not got_content:
+            if got_content:
+                full_response = " ".join(response_parts)
+                self._log_transcript(prompt, full_response, think_seconds)
+            else:
                 logger.warning(f"No text in clawdbot response: {output[:200]}")
                 await self.push_frame(
                     LLMTextFrame("I'm sorry, I didn't catch that. Could you say that again?")
