@@ -1,311 +1,428 @@
 #!/usr/bin/env python3
 """
-Discord Transport Adapter for Pipecat
+Discord Transport for Pipecat v2
 
-This is the novel component that bridges py-cord's Discord voice I/O with Pipecat's frame protocol.
-Since Pipecat doesn't have native Discord support, we create a custom transport that:
+Extends BaseTransport with proper input()/output() methods returning
+BaseInputTransport/BaseOutputTransport, bridging py-cord's Discord voice I/O
+with Pipecat's frame pipeline.
 
-1. Handles Discord bot connection and voice channel lifecycle
-2. Converts Discord's 48kHz stereo PCM to Pipecat's preferred audio format
-3. Manages the bidirectional audio flow between Discord and the pipeline
-4. Provides proper async integration with Pipecat's frame processing
+Audio flow:
+  Discord mic (48kHz stereo) → resample → InputAudioRawFrame (16kHz mono) → pipeline
+  pipeline → OutputAudioRawFrame → resample → Discord speaker (48kHz stereo)
 
-Technical Notes:
-- Discord uses Opus codec internally, py-cord provides PCM decoded frames
-- We need to handle resampling: 48kHz stereo ↔ 16kHz mono for processing
-- Must manage timing and buffering to avoid audio dropouts
+Threading model:
+  Discord's voice recv/send runs in separate threads. We use asyncio queues
+  and call_soon_threadsafe() to bridge safely to the pipeline's event loop.
 """
 
 import asyncio
-import os
-import numpy as np
-from typing import Optional, Callable, Awaitable
-import discord
-from discord.ext import commands
+import threading
+import time
+from collections import defaultdict
+from typing import Optional
 
-# Pipecat imports
+import discord
+import numpy as np
+from loguru import logger
+
 from pipecat.frames.frames import (
-    Frame, 
-    AudioRawFrame, 
+    Frame,
     InputAudioRawFrame,
     OutputAudioRawFrame,
-    StartFrame, 
+    StartFrame,
     EndFrame,
-    CancelFrame,
-    UserStartedSpeakingFrame,
-    UserStoppedSpeakingFrame
 )
-from pipecat.transports.base_transport import BaseTransport
-from pipecat.transports.base_input import BaseInputTransport  
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.transports.base_transport import BaseTransport, TransportParams
+from pipecat.transports.base_input import BaseInputTransport
 from pipecat.transports.base_output import BaseOutputTransport
-from pipecat.processors.frame_processor import FrameProcessor
-from pipecat.processors.audio.audio_buffer_processor import (
-    create_stream_resampler, 
-    interleave_stereo_audio
-)
 
-# Audio configuration
-DISCORD_SAMPLE_RATE = 48000  # Discord's audio sample rate
-DISCORD_CHANNELS = 2         # Stereo
-PROCESSING_SAMPLE_RATE = 16000  # Preferred for STT/processing
-PROCESSING_CHANNELS = 1      # Mono
+# Audio constants
+DISCORD_SAMPLE_RATE = 48000
+DISCORD_CHANNELS = 2
+DISCORD_FRAME_BYTES = 3840  # 20ms at 48kHz stereo int16
+PIPELINE_SAMPLE_RATE = 16000
+PIPELINE_CHANNELS = 1
 
-class DiscordAudioSink(discord.AudioSink):
+# Auto-join config
+AUTO_JOIN_USER_ID = 1411361963308613867  # Anna
+
+
+def resample_discord_to_pipeline(pcm_48k_stereo: bytes) -> bytes:
+    """Convert Discord PCM (48kHz stereo int16) → pipeline (16kHz mono int16).
+
+    Steps: stereo→mono by averaging, then downsample 3:1.
+    Returns int16 PCM bytes suitable for InputAudioRawFrame.
     """
-    Audio sink for receiving audio from Discord voice channel
-    Converts incoming audio to Pipecat frames
+    samples = np.frombuffer(pcm_48k_stereo, dtype=np.int16)
+    if len(samples) == 0:
+        return b""
+    # Stereo to mono: average channels
+    stereo = samples.reshape(-1, 2)
+    mono = ((stereo[:, 0].astype(np.int32) + stereo[:, 1].astype(np.int32)) // 2).astype(np.int16)
+    # Downsample 48kHz → 16kHz (3:1)
+    downsampled = mono[::3]
+    return downsampled.tobytes()
+
+
+def resample_pipeline_to_discord(pcm_data: bytes, source_rate: int, volume: float = 0.3) -> bytes:
+    """Convert pipeline PCM (int16 mono) → Discord (48kHz stereo int16).
+
+    Handles 16kHz (3x upsample) and 24kHz (2x upsample) source rates.
+    volume: output gain multiplier (0.0-1.0). Default 0.3 to avoid blasting eardrums.
     """
-    
-    def __init__(self, transport: 'DiscordTransport'):
+    samples = np.frombuffer(pcm_data, dtype=np.int16)
+    if len(samples) == 0:
+        return b""
+
+    # Upsample to 48kHz
+    if source_rate == 16000:
+        upsampled = np.repeat(samples, 3)
+    elif source_rate == 24000:
+        upsampled = np.repeat(samples, 2)
+    elif source_rate == 48000:
+        upsampled = samples
+    else:
+        # Generic resampling via linear interpolation
+        ratio = 48000 / source_rate
+        indices = np.arange(0, len(samples), 1.0 / ratio)[:int(len(samples) * ratio)]
+        indices = np.clip(indices, 0, len(samples) - 1)
+        upsampled = np.interp(indices, np.arange(len(samples)), samples.astype(np.float64)).astype(np.int16)
+
+    # Apply volume scaling
+    scaled = (upsampled.astype(np.float32) * volume).clip(-32768, 32767).astype(np.int16)
+
+    # Mono → stereo: interleave same data into both channels
+    stereo = np.empty(len(scaled) * 2, dtype=np.int16)
+    stereo[0::2] = scaled
+    stereo[1::2] = scaled
+    return stereo.tobytes()
+
+
+class DiscordAudioSink(discord.sinks.Sink):
+    """Receives audio from Discord voice channel, forwards to input transport."""
+
+    def __init__(self, input_transport: "DiscordInputTransport"):
         super().__init__()
-        self.transport = transport
-        self.resampler = create_stream_resampler(
-            input_sample_rate=DISCORD_SAMPLE_RATE,
-            output_sample_rate=PROCESSING_SAMPLE_RATE,
-            num_channels=DISCORD_CHANNELS,
-            output_channels=PROCESSING_CHANNELS
-        )
-        
-    def on_audio(self, user, data):
-        """Called when audio data is received from Discord"""
-        if data and len(data) > 0:
-            # Convert from Discord's format to processing format
-            # data is bytes (PCM, 48kHz, stereo, signed 16-bit LE)
-            audio_np = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
-            
-            # Resample to 16kHz mono
-            processed_audio = self.resampler.resample(audio_np)
-            
-            # Create Pipecat audio frame
-            frame = InputAudioRawFrame(
-                audio=processed_audio.tobytes(),
-                sample_rate=PROCESSING_SAMPLE_RATE,
-                num_channels=PROCESSING_CHANNELS
-            )
-            
-            # Send to pipeline (async)
-            asyncio.create_task(self.transport._handle_input_frame(frame))
+        self._input_transport = input_transport
 
-class DiscordAudioSource:
-    """
-    Audio source for sending audio to Discord voice channel
-    Receives processed audio from Pipecat pipeline
-    """
-    
-    def __init__(self, transport: 'DiscordTransport'):
-        self.transport = transport
-        self.voice_client: Optional[discord.VoiceClient] = None
-        self.audio_queue = asyncio.Queue()
-        self.resampler = create_stream_resampler(
-            input_sample_rate=PROCESSING_SAMPLE_RATE,
-            output_sample_rate=DISCORD_SAMPLE_RATE,
-            num_channels=PROCESSING_CHANNELS,
-            output_channels=DISCORD_CHANNELS
-        )
-        self.playing = False
-        
-    async def queue_audio(self, frame: OutputAudioRawFrame):
-        """Queue audio frame for playback to Discord"""
-        await self.audio_queue.put(frame)
-        
-        # Start playback if not already playing
-        if not self.playing and self.voice_client:
-            await self._start_playback()
-    
-    async def _start_playback(self):
-        """Start audio playback to Discord"""
-        if self.playing or not self.voice_client:
+    _write_count = 0
+
+    def write(self, data, user):
+        """Called from Discord's decode thread for each audio packet.
+
+        We resample and push into the input transport's async queue
+        using call_soon_threadsafe.
+        """
+        self._write_count += 1
+        if self._write_count <= 5 or self._write_count % 500 == 0:
+            logger.debug(f"Sink.write called #{self._write_count}: user={user}, data_len={len(data) if data else 0}")
+
+        if user is None or not data:
             return
-            
-        self.playing = True
-        
-        try:
-            # Create audio source that reads from our queue
-            audio_source = DiscordPCMAudioSource(self)
-            self.voice_client.play(audio_source)
-            
-        except Exception as e:
-            print(f"Error starting Discord audio playback: {e}")
-            self.playing = False
-            
-    async def get_audio_chunk(self) -> Optional[bytes]:
-        """Get next audio chunk for Discord playback"""
-        try:
-            # Wait for audio with timeout to avoid blocking Discord
-            frame = await asyncio.wait_for(self.audio_queue.get(), timeout=0.02)
-            
-            # Convert from processing format to Discord format
-            audio_np = np.frombuffer(frame.audio, dtype=np.float32)
-            
-            # Resample to Discord format (48kHz stereo)
-            discord_audio = self.resampler.resample(audio_np)
-            
-            # Convert to int16 and return as bytes
-            discord_audio_int = (discord_audio * 32767).astype(np.int16)
-            return discord_audio_int.tobytes()
-            
-        except asyncio.TimeoutError:
-            # No audio available, return silence
-            silence_samples = int(DISCORD_SAMPLE_RATE * 0.02 * DISCORD_CHANNELS)  # 20ms of silence
-            silence = np.zeros(silence_samples, dtype=np.int16)
-            return silence.tobytes()
 
-class DiscordPCMAudioSource(discord.AudioSource):
-    """Discord audio source that reads from our processed audio queue"""
-    
-    def __init__(self, audio_source: DiscordAudioSource):
-        super().__init__()
-        self.audio_source = audio_source
-        
-    def read(self) -> bytes:
-        """Read audio data for Discord (blocking call)"""
-        # This is called by Discord in a thread, so we need to handle async carefully
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            return loop.run_until_complete(self.audio_source.get_audio_chunk())
-        finally:
-            loop.close()
-            
+        # Resample to pipeline format (16kHz mono int16)
+        pipeline_audio = resample_discord_to_pipeline(data)
+        if not pipeline_audio:
+            return
+
+        # Create InputAudioRawFrame
+        frame = InputAudioRawFrame(
+            audio=pipeline_audio,
+            sample_rate=PIPELINE_SAMPLE_RATE,
+            num_channels=PIPELINE_CHANNELS,
+        )
+
+        # Thread-safe push to the input transport's queue
+        loop = self._input_transport._loop
+        if loop and loop.is_running():
+            loop.call_soon_threadsafe(self._input_transport._audio_queue_sync.put_nowait, frame)
+        elif self._write_count <= 5:
+            logger.warning(f"Sink.write: loop not ready (loop={loop})")
+
+    def cleanup(self):
+        pass
+
+
+class DiscordAudioSource(discord.AudioSource):
+    """Plays audio to Discord voice channel from output transport's buffer."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._buffer = bytearray()
+        self._finished = False
+
     def is_opus(self) -> bool:
-        return False  # We're providing raw PCM
+        return False
+
+    def read(self) -> bytes:
+        """Called every 20ms from Discord's send thread.
+
+        Must return exactly 3840 bytes of 48kHz stereo int16 PCM.
+        """
+        with self._lock:
+            if len(self._buffer) >= DISCORD_FRAME_BYTES:
+                frame = bytes(self._buffer[:DISCORD_FRAME_BYTES])
+                del self._buffer[:DISCORD_FRAME_BYTES]
+                return frame
+            elif self._finished and len(self._buffer) > 0:
+                # Pad final frame with silence
+                frame = bytes(self._buffer) + b"\x00" * (DISCORD_FRAME_BYTES - len(self._buffer))
+                self._buffer.clear()
+                return frame
+            elif self._finished:
+                return b""
+            else:
+                # Buffer underrun → silence
+                return b"\x00" * DISCORD_FRAME_BYTES
+
+    def feed(self, data: bytes):
+        with self._lock:
+            self._buffer.extend(data)
+
+    def finish(self):
+        with self._lock:
+            self._finished = True
+
+    def reset(self):
+        with self._lock:
+            self._buffer.clear()
+            self._finished = False
+
+    def cleanup(self):
+        pass
+
+
+class DiscordInputTransport(BaseInputTransport):
+    """Pipecat input transport that receives audio from Discord."""
+
+    def __init__(self, params: TransportParams, **kwargs):
+        super().__init__(params, **kwargs)
+        # Sync queue used by the sink's write() (from Discord thread)
+        self._audio_queue_sync: asyncio.Queue = asyncio.Queue()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._feeder_task: Optional[asyncio.Task] = None
+
+    async def start(self, frame: StartFrame):
+        await super().start(frame)
+        # Ensure the audio input queue is created (BaseInputTransport creates it
+        # in set_transport_ready, which may not be called for custom transports)
+        await self.set_transport_ready(frame)
+        self._loop = asyncio.get_running_loop()
+        # Start a task that drains the sync queue and pushes frames into the pipeline
+        self._feeder_task = self.create_task(self._feeder_loop())
+
+    async def stop(self, frame: EndFrame):
+        if self._feeder_task:
+            await self.cancel_task(self._feeder_task)
+            self._feeder_task = None
+        await super().stop(frame)
+
+    _feed_count = 0
+
+    async def _feeder_loop(self):
+        """Drain audio from the sync queue and push into the pipeline via push_audio_frame."""
+        logger.info("Feeder loop started")
+        while True:
+            try:
+                frame = await asyncio.wait_for(self._audio_queue_sync.get(), timeout=1.0)
+                self._feed_count += 1
+                if self._feed_count <= 5 or self._feed_count % 500 == 0:
+                    has_q = hasattr(self, '_audio_in_queue') and self._audio_in_queue is not None
+                    logger.debug(f"Feeder #{self._feed_count}: audio_in_queue_ready={has_q}, qsize={self._audio_queue_sync.qsize()}")
+                # Only push if the parent's audio queue has been created (after start)
+                if hasattr(self, '_audio_in_queue') and self._audio_in_queue is not None:
+                    await self.push_audio_frame(frame)
+                elif self._feed_count <= 10:
+                    logger.warning("Feeder: _audio_in_queue not ready, dropping frame")
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"DiscordInputTransport feeder error: {e}")
+
+
+class DiscordOutputTransport(BaseOutputTransport):
+    """Pipecat output transport that plays audio to Discord."""
+
+    def __init__(self, params: TransportParams, audio_source: DiscordAudioSource, transport: "DiscordTransport" = None, **kwargs):
+        super().__init__(params, **kwargs)
+        self._audio_source = audio_source
+        self._transport = transport
+        self._playback_started = False
+
+    async def start(self, frame: StartFrame):
+        await super().start(frame)
+        # Ensure media senders are created (BaseOutputTransport creates them
+        # in set_transport_ready, which may not be called for custom transports)
+        await self.set_transport_ready(frame)
+
+    async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
+        """Write audio frame to Discord. Called by the base class's media sender."""
+        if not self._audio_source:
+            return False
+
+        # Start playback on first audio frame (avoids green outline when idle)
+        if not self._playback_started and self._transport and self._transport._voice_client:
+            vc = self._transport._voice_client
+            if not vc.is_playing():
+                self._audio_source.reset()
+                vc.play(self._audio_source)
+                self._playback_started = True
+
+        # The frame audio is int16 PCM at frame.sample_rate.
+        # Resample to Discord's 48kHz stereo int16.
+        discord_audio = resample_pipeline_to_discord(frame.audio, frame.sample_rate)
+        self._audio_source.feed(discord_audio)
+        return True
+
 
 class DiscordTransport(BaseTransport):
+    """Full Discord transport implementing BaseTransport.
+
+    Creates a Discord bot, manages voice channel connections,
+    and provides input()/output() frame processors for the pipeline.
     """
-    Main Discord transport that integrates with Pipecat pipeline
-    """
-    
+
     def __init__(
-        self, 
+        self,
+        *,
         bot_token: str,
-        guild_id: int,
-        auto_join_user_id: Optional[int] = None
+        guild_id: int = 0,
+        auto_join_user_id: int = AUTO_JOIN_USER_ID,
+        params: Optional[TransportParams] = None,
     ):
-        super().__init__()
-        self.bot_token = bot_token
-        self.guild_id = guild_id
-        self.auto_join_user_id = auto_join_user_id
-        
-        # Discord bot setup
+        super().__init__(
+            name="DiscordTransport",
+            input_name="DiscordInput",
+            output_name="DiscordOutput",
+        )
+
+        self._bot_token = bot_token
+        self._guild_id = guild_id
+        self._auto_join_user_id = auto_join_user_id
+
+        # Transport params
+        self._params = params or TransportParams(
+            audio_in_enabled=True,
+            audio_in_sample_rate=PIPELINE_SAMPLE_RATE,
+            audio_in_channels=PIPELINE_CHANNELS,
+            audio_out_enabled=True,
+            audio_out_sample_rate=PIPELINE_SAMPLE_RATE,
+            audio_out_channels=PIPELINE_CHANNELS,
+        )
+
+        # Discord components
         intents = discord.Intents.default()
         intents.voice_states = True
         intents.guilds = True
-        
-        self.bot = commands.Bot(command_prefix='!', intents=intents)
-        self.voice_client: Optional[discord.VoiceClient] = None
-        
-        # Audio components
-        self.audio_sink: Optional[DiscordAudioSink] = None
-        self.audio_source: Optional[DiscordAudioSource] = None
-        
-        # Setup Discord event handlers
-        self._setup_discord_events()
-        
-    def _setup_discord_events(self):
-        """Setup Discord bot event handlers"""
-        
-        @self.bot.event
+        self._bot = discord.Bot(intents=intents)
+        self._voice_client: Optional[discord.VoiceClient] = None
+
+        # Audio I/O
+        self._audio_source = DiscordAudioSource()
+        self._audio_sink: Optional[DiscordAudioSink] = None
+
+        # Pipecat transports
+        self._input_transport = DiscordInputTransport(self._params, name="DiscordInput")
+        self._output_transport = DiscordOutputTransport(
+            self._params, self._audio_source, transport=self, name="DiscordOutput"
+        )
+
+        # Wire up Discord events
+        self._setup_events()
+
+    def input(self) -> FrameProcessor:
+        return self._input_transport
+
+    def output(self) -> FrameProcessor:
+        return self._output_transport
+
+    @property
+    def bot(self) -> discord.Bot:
+        return self._bot
+
+    def _setup_events(self):
+        @self._bot.event
         async def on_ready():
-            print(f"Discord bot logged in as {self.bot.user}")
-            
-            # Auto-join voice channel if configured
-            if self.auto_join_user_id:
+            logger.info(f"Discord bot connected as {self._bot.user}")
+            if self._auto_join_user_id:
                 await self._try_auto_join()
-                
-        @self.bot.event
+
+        @self._bot.event
         async def on_voice_state_update(member, before, after):
-            # Auto-join when target user joins a voice channel
-            if (member.id == self.auto_join_user_id and 
-                after.channel and 
-                not self.voice_client):
-                await self._join_voice_channel(after.channel)
-                
+            # Auto-join when target user joins voice
+            if (
+                self._auto_join_user_id
+                and member.id == self._auto_join_user_id
+                and after.channel
+                and not self._voice_client
+            ):
+                await self._join_channel(after.channel)
+
+            # Auto-leave when no humans remain
+            if before.channel and (after.channel is None or after.channel != before.channel):
+                if self._voice_client and self._voice_client.channel == before.channel:
+                    humans = [m for m in before.channel.members if not m.bot]
+                    if not humans:
+                        await self._leave_channel()
+
     async def _try_auto_join(self):
-        """Try to auto-join voice channel where target user is"""
-        guild = self.bot.get_guild(self.guild_id)
-        if not guild:
-            print(f"Guild {self.guild_id} not found")
-            return
-            
-        # Find the target user
-        target_member = guild.get_member(self.auto_join_user_id)
-        if not target_member:
-            print(f"Auto-join user {self.auto_join_user_id} not found")
-            return
-            
-        # Check if they're in a voice channel
-        if target_member.voice and target_member.voice.channel:
-            await self._join_voice_channel(target_member.voice.channel)
-            
-    async def _join_voice_channel(self, channel):
-        """Join a voice channel and setup audio"""
+        """Find the target user and join their voice channel."""
+        for guild in self._bot.guilds:
+            member = guild.get_member(self._auto_join_user_id)
+            if member and member.voice and member.voice.channel:
+                await self._join_channel(member.voice.channel)
+                return
+
+    async def _join_channel(self, channel):
+        """Join a voice channel, start recording and playback."""
         try:
-            print(f"Joining voice channel: {channel.name}")
-            self.voice_client = await channel.connect()
-            
-            # Setup audio sink for receiving audio
-            self.audio_sink = DiscordAudioSink(self)
-            await self.voice_client.create_sink(self.audio_sink)
-            
-            # Setup audio source for sending audio
-            self.audio_source = DiscordAudioSource(self)
-            self.audio_source.voice_client = self.voice_client
-            
-            print("Discord audio setup complete")
-            
-            # Send start frame to pipeline
-            await self._handle_input_frame(StartFrame())
-            
+            if self._voice_client:
+                await self._leave_channel()
+
+            logger.info(f"Joining voice channel: {channel.name}")
+            self._voice_client = await channel.connect()
+
+            # Setup recording sink → feeds our input transport
+            self._audio_sink = DiscordAudioSink(self._input_transport)
+
+            async def _on_stop(sink, ctx):
+                pass
+
+            self._voice_client.start_recording(self._audio_sink, _on_stop, None)
+
+            # Don't start playback yet — we'll start it when TTS has audio to play
+            # This avoids the green "speaking" outline when idle
+            self._audio_source.reset()
+
+            logger.info("Discord voice connected and streaming")
+
         except Exception as e:
-            print(f"Error joining voice channel: {e}")
-            
-    async def _handle_input_frame(self, frame: Frame):
-        """Handle frames coming from Discord audio"""
-        if hasattr(self, '_input_processor') and self._input_processor:
-            await self._input_processor.process_frame(frame, FrameDirection.DOWNSTREAM)
-            
-    async def _handle_output_frame(self, frame: Frame):
-        """Handle frames going to Discord audio"""
-        if isinstance(frame, OutputAudioRawFrame) and self.audio_source:
-            await self.audio_source.queue_audio(frame)
-            
-    async def start(self):
-        """Start the Discord transport"""
-        print("Starting Discord transport...")
-        
-        # Start Discord bot
-        await self.bot.start(self.bot_token)
-        
-    async def stop(self):
-        """Stop the Discord transport"""
-        print("Stopping Discord transport...")
-        
-        if self.voice_client:
-            await self.voice_client.disconnect()
-            
-        await self.bot.close()
-        
-        # Send end frame
-        if hasattr(self, '_input_processor') and self._input_processor:
-            await self._handle_input_frame(EndFrame())
+            logger.error(f"Error joining voice channel: {e}")
 
+    async def _leave_channel(self):
+        """Leave voice channel and clean up."""
+        if self._voice_client:
+            try:
+                self._voice_client.stop_recording()
+            except Exception:
+                pass
+            try:
+                await self._voice_client.disconnect()
+            except Exception:
+                pass
+            self._voice_client = None
+            self._audio_sink = None
+            logger.info("Left voice channel")
 
-# Test function
-async def test_discord_transport():
-    """Test the Discord transport implementation"""
-    token = os.getenv('VOICE_BOT_TOKEN')
-    if not token:
-        print("VOICE_BOT_TOKEN environment variable not set")
-        return
-        
-    transport = DiscordTransport(
-        bot_token=token,
-        guild_id=1465514323291144377,
-        auto_join_user_id=1411361963308613867
-    )
-    
-    print("Discord transport created successfully")
-    # Note: Full testing requires Discord connection
+    async def start_bot(self):
+        """Start the Discord bot. Call this from the main bot script."""
+        await self._bot.start(self._bot_token)
 
-if __name__ == "__main__":
-    asyncio.run(test_discord_transport())
+    async def stop_bot(self):
+        """Stop the Discord bot."""
+        await self._leave_channel()
+        if not self._bot.is_closed():
+            await self._bot.close()

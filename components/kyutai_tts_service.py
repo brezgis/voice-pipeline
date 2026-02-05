@@ -1,440 +1,185 @@
 #!/usr/bin/env python3
 """
-Kyutai TTS 1.6B Service for Pipecat
+Kyutai TTS 1.6B Service for Pipecat v2
 
-This service integrates the Kyutai TTS 1.6B model for high-quality streaming text-to-speech.
-The model supports true streaming generation, starting audio output before text is complete.
+Extends Pipecat's TTSService properly:
+- Implements run_tts() abstract method
+- Yields TTSAudioRawFrame with 24kHz int16 PCM
+- Base class handles text aggregation, LLMFullResponseEndFrame flushing, etc.
+- BaseOutputTransport handles resampling if needed
 
-Key features:
-- 1.6B parameter model with Mimi codec for high quality
-- Streaming TTS: can start playing audio before full text is processed
-- English/French support
-- Voice conditioning through pre-computed embeddings
-- CUDA acceleration with float16 precision
-
-Technical details:
-- Uses the moshi library for model inference
-- Requires Kyutai TTS model files and voice embeddings
-- Outputs 24kHz mono audio that gets resampled for Discord
-- VRAM usage: ~5GB
+Uses the moshi library to load Kyutai TTS 1.6B from HuggingFace cache.
+Benchmarked at 5.28x realtime with n_q=8 on RTX 5070 Ti.
 """
 
 import asyncio
-import os
-import tempfile
-from typing import Optional, Dict, Any, AsyncIterator
+from typing import AsyncGenerator, Optional
+
 import numpy as np
 import torch
+from loguru import logger
 
-# Pipecat imports
 from pipecat.frames.frames import (
     Frame,
-    TextFrame, 
+    TTSAudioRawFrame,
     TTSStartedFrame,
     TTSStoppedFrame,
-    OutputAudioRawFrame,
-    TTSAudioRawFrame,
-    LLMTextFrame
 )
 from pipecat.services.tts_service import TTSService
 
-# Moshi/Kyutai imports
-try:
-    from moshi import models
-    from moshi.models.loaders import load_model_bundle 
-    from moshi.models.generation import Generators
-    import safetensors.torch
-except ImportError:
-    print("Warning: moshi package not available. Install with: pip install moshi")
-    models = None
+# Kyutai TTS constants
+KYUTAI_SAMPLE_RATE = 24000
+KYUTAI_MODEL_REPO = "kyutai/tts-1.6b-en_fr"
+KYUTAI_VOICE = "expresso/ex03-ex01_awe_001_channel1_1323s.wav"
+KYUTAI_N_Q = 8  # Fewer quantization steps = faster (benchmarked 5.28x RT)
+KYUTAI_TEMP = 0.6
+KYUTAI_CFG_COEF = 2.0
 
 
 class KyutaiTTSService(TTSService):
+    """Kyutai TTS 1.6B service for Pipecat.
+
+    Loads from HuggingFace cache (already downloaded from benchmark).
+    Outputs 24kHz mono int16 PCM via TTSAudioRawFrame.
     """
-    Kyutai TTS service for Pipecat pipeline
-    
-    Provides streaming text-to-speech using the Kyutai TTS 1.6B model
-    """
-    
+
     def __init__(
         self,
-        model_path: str,
-        voice_model_path: str = None,
-        voice_name: str = "default",
+        *,
+        model_repo: str = KYUTAI_MODEL_REPO,
+        voice: str = KYUTAI_VOICE,
+        n_q: int = KYUTAI_N_Q,
+        temp: float = KYUTAI_TEMP,
+        cfg_coef: float = KYUTAI_CFG_COEF,
         device: str = "cuda",
-        sample_rate: int = 24000,
-        streaming: bool = True,
-        **kwargs
+        **kwargs,
     ):
-        super().__init__(**kwargs)
-        
-        if models is None:
-            raise ImportError("moshi package is required for Kyutai TTS")
-            
-        self.model_path = model_path
-        self.voice_model_path = voice_model_path
-        self.voice_name = voice_name
-        self.device = device
-        self.sample_rate = sample_rate
-        self.streaming = streaming
-        
-        # Model components
-        self.model = None
-        self.tokenizer = None
-        self.voice_embed = None
-        self._model_loaded = False
-        
-        # Generation parameters
-        self.generation_params = {
-            'n_q': 32,  # Number of quantization levels
-            'temp': 0.8,  # Temperature for sampling
-            'cfg_coef': 1.0,  # Classifier-free guidance
-            'padding_between': 0.0,  # Silence between segments
-        }
-        
-    async def _load_model(self):
-        """Load the Kyutai TTS model and voice embeddings"""
-        if self._model_loaded:
+        # Set sample_rate before calling super().__init__
+        super().__init__(sample_rate=KYUTAI_SAMPLE_RATE, **kwargs)
+
+        self._model_repo = model_repo
+        self._voice = voice
+        self._n_q = n_q
+        self._temp = temp
+        self._cfg_coef = cfg_coef
+        self._device_str = device
+
+        self._tts_model = None
+        self._voice_path = None
+        self._condition_attributes = None
+        self._loaded = False
+
+    async def _ensure_loaded(self):
+        """Load the model on first use (heavy, ~5GB VRAM)."""
+        if self._loaded:
             return
-            
-        print(f"Loading Kyutai TTS model from {self.model_path}")
-        
-        try:
-            # Load model bundle (this includes the TTS model and tokenizers)
-            bundle = load_model_bundle(self.model_path, device=self.device)
-            self.model = bundle.model
-            self.tokenizer = bundle.tokenizer
-            
-            # Load voice embeddings if provided
-            if self.voice_model_path:
-                print(f"Loading voice model: {self.voice_model_path}")
-                voice_data = safetensors.torch.load_file(self.voice_model_path)
-                self.voice_embed = voice_data.get('voice_embed')
-                
-                if self.voice_embed is not None:
-                    self.voice_embed = self.voice_embed.to(self.device)
-                    print(f"Voice embedding loaded: {self.voice_embed.shape}")
-                else:
-                    print("Warning: No voice embedding found in voice model file")
-            
-            # Set model to eval mode
-            self.model.eval()
-            
-            # Enable CUDA optimizations if available
-            if self.device == "cuda" and torch.cuda.is_available():
-                # Use float16 for memory efficiency (Blackwell compatible)
-                self.model = self.model.half()
-                print(f"Model loaded on {self.device} with float16 precision")
-            
-            self._model_loaded = True
-            print("Kyutai TTS model loaded successfully")
-            
-        except Exception as e:
-            print(f"Error loading Kyutai TTS model: {e}")
-            raise
-    
-    async def _generate_speech_streaming(self, text: str) -> AsyncIterator[bytes]:
-        """
-        Generate speech audio with streaming output
-        
-        This yields audio chunks as they're generated, enabling low-latency playback
-        """
-        await self._load_model()
-        
-        try:
-            # Tokenize input text
-            tokens = self.tokenizer.encode(text)
-            tokens = torch.tensor([tokens], device=self.device)
-            
-            # Create generation context
-            generators = Generators(
-                model=self.model,
-                device=self.device,
-                **self.generation_params
+
+        logger.info(f"Loading Kyutai TTS from {self._model_repo} (n_q={self._n_q})...")
+
+        def _load():
+            from moshi.models.loaders import CheckpointInfo
+            from moshi.models.tts import TTSModel
+
+            device = torch.device(self._device_str)
+            checkpoint_info = CheckpointInfo.from_hf_repo(self._model_repo)
+            tts_model = TTSModel.from_checkpoint_info(
+                checkpoint_info, n_q=self._n_q, temp=self._temp, device=device
             )
-            
-            # Generate audio tokens with streaming
-            if self.streaming:
-                # Stream generation: yield chunks as they're generated
-                audio_chunks = []
-                
-                for chunk in generators.streaming_generate(
-                    tokens=tokens,
-                    voice_embed=self.voice_embed,
-                    chunk_length_ms=500  # 500ms chunks for low latency
-                ):
-                    # Decode audio chunk
-                    audio_chunk = chunk.cpu().numpy().astype(np.float32)
-                    audio_chunks.append(audio_chunk)
-                    
-                    # Yield audio chunk immediately
-                    yield audio_chunk.tobytes()
-                    
-            else:
-                # Non-streaming: generate full audio then yield chunks
-                audio_tokens = generators.generate(
-                    tokens=tokens,
-                    voice_embed=self.voice_embed
-                )
-                
-                # Decode full audio
-                audio = audio_tokens.cpu().numpy().astype(np.float32)
-                
-                # Chunk and yield
-                chunk_size = int(self.sample_rate * 0.1)  # 100ms chunks
-                for i in range(0, len(audio), chunk_size):
-                    chunk = audio[i:i + chunk_size]
-                    yield chunk.tobytes()
-                    
-        except Exception as e:
-            print(f"Error generating speech with Kyutai TTS: {e}")
-            # Return silence on error
-            silence = np.zeros(int(self.sample_rate * 0.5), dtype=np.float32)
-            yield silence.tobytes()
-    
-    async def process_frame(self, frame: Frame, direction):
-        """Process frames from the pipeline"""
-        await super().process_frame(frame, direction)
-        
-        if isinstance(frame, (TextFrame, LLMTextFrame)):
-            # Extract text
-            if isinstance(frame, TextFrame):
-                text = frame.text
-            else:
-                text = frame.text
-                
-            if not text or not text.strip():
-                return
-                
-            # Send TTS started frame
-            await self.push_frame(TTSStartedFrame(), direction)
-            
-            try:
-                # Generate speech with streaming
-                async for audio_chunk in self._generate_speech_streaming(text):
-                    if audio_chunk:
-                        # Create audio frame
-                        audio_frame = OutputAudioRawFrame(
-                            audio=audio_chunk,
-                            sample_rate=self.sample_rate,
-                            num_channels=1  # Mono output
+            voice_path = tts_model.get_voice_path(self._voice)
+            condition_attributes = tts_model.make_condition_attributes(
+                [voice_path], cfg_coef=self._cfg_coef
+            )
+            return tts_model, voice_path, condition_attributes
+
+        # Load in thread to avoid blocking the event loop
+        self._tts_model, self._voice_path, self._condition_attributes = (
+            await asyncio.get_event_loop().run_in_executor(None, _load)
+        )
+        self._loaded = True
+
+        vram = torch.cuda.memory_allocated() / 1e9
+        logger.info(f"Kyutai TTS loaded. VRAM: {vram:.2f} GB")
+
+    async def run_tts(self, text: str) -> AsyncGenerator[Frame, None]:
+        """Generate speech from text, yielding TTSAudioRawFrame chunks.
+
+        This is the abstract method required by TTSService. The base class
+        calls this via process_generator() after text aggregation.
+        """
+        if not text.strip():
+            return
+
+        await self._ensure_loaded()
+
+        logger.debug(f"TTS generating: {text[:60]}...")
+
+        yield TTSStartedFrame()
+
+        try:
+            # Run the actual generation in a thread (it's CPU/GPU bound)
+            audio_int16 = await asyncio.get_event_loop().run_in_executor(
+                None, self._generate_sync, text
+            )
+
+            if audio_int16 is not None and len(audio_int16) > 0:
+                # Chunk the audio for streaming (~100ms chunks)
+                chunk_samples = KYUTAI_SAMPLE_RATE // 10  # 2400 samples = 100ms
+                chunk_bytes = chunk_samples * 2  # int16 = 2 bytes per sample
+
+                audio_bytes = audio_int16.tobytes()
+                for i in range(0, len(audio_bytes), chunk_bytes):
+                    chunk = audio_bytes[i : i + chunk_bytes]
+                    if chunk:
+                        yield TTSAudioRawFrame(
+                            audio=chunk,
+                            sample_rate=KYUTAI_SAMPLE_RATE,
+                            num_channels=1,
                         )
-                        await self.push_frame(audio_frame, direction)
-                        
-            except Exception as e:
-                print(f"TTS generation error: {e}")
-                
-            finally:
-                # Send TTS stopped frame
-                await self.push_frame(TTSStoppedFrame(), direction)
-    
-    async def start(self):
-        """Start the TTS service"""
-        await self._load_model()
-        
-    async def run_tts(self, text: str) -> AsyncIterator[Frame]:
-        """
-        Required abstract method for TTSService
-        Generate TTS frames for the given text
-        """
-        if not text.strip():
-            return
-            
-        # Send start frame
-        yield TTSStartedFrame()
-        
-        try:
-            # Generate speech with streaming
-            async for audio_chunk in self._generate_speech_streaming(text):
-                if audio_chunk:
-                    # Create audio frame
-                    audio_frame = OutputAudioRawFrame(
-                        audio=audio_chunk,
-                        sample_rate=self.sample_rate,
-                        num_channels=1  # Mono output
-                    )
-                    yield audio_frame
-                    
-        except Exception as e:
-            print(f"TTS generation error: {e}")
-            
-        finally:
-            # Send stop frame
-            yield TTSStoppedFrame()
-    
-    async def stop(self):
-        """Stop the TTS service and cleanup"""
-        if self.model:
-            # Move model to CPU to free GPU memory
-            self.model = self.model.cpu()
-            
-        # Clear CUDA cache
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            
-        self._model_loaded = False
-        print("Kyutai TTS service stopped")
-
-
-class KyutaiTTSServiceSimple(TTSService):
-    """
-    Simplified version using moshi CLI tools
-    
-    This version shells out to the moshi command-line tool instead of
-    using the Python API directly. Useful as a fallback if the API
-    integration has issues.
-    """
-    
-    def __init__(
-        self,
-        model_repo: str = "kyutai/tts-1.6b-en_fr",
-        voice_name: str = "default",
-        **kwargs
-    ):
-        super().__init__(**kwargs)
-        self.model_repo = model_repo
-        self.voice_name = voice_name
-        
-    async def process_frame(self, frame: Frame, direction):
-        """Process frames using moshi CLI"""
-        await super().process_frame(frame, direction)
-        
-        if isinstance(frame, (TextFrame, LLMTextFrame)):
-            text = frame.text if isinstance(frame, TextFrame) else frame.text
-            
-            if not text or not text.strip():
-                return
-                
-            await self.push_frame(TTSStartedFrame(), direction)
-            
-            try:
-                # Use temporary file for output
-                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
-                    output_path = tmp_file.name
-                    
-                # Run moshi TTS command
-                cmd = [
-                    'python', '-m', 'moshi.run_inference',
-                    '--hf-repo', self.model_repo,
-                    '--text', text,
-                    '--output', output_path
-                ]
-                
-                process = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                
-                stdout, stderr = await process.communicate()
-                
-                if process.returncode == 0 and os.path.exists(output_path):
-                    # Read generated audio file
-                    import soundfile as sf
-                    audio_data, sample_rate = sf.read(output_path)
-                    
-                    # Convert to the expected format
-                    if audio_data.dtype != np.float32:
-                        audio_data = audio_data.astype(np.float32)
-                        
-                    # Send as audio frame
-                    audio_frame = OutputAudioRawFrame(
-                        audio=audio_data.tobytes(),
-                        sample_rate=sample_rate,
-                        num_channels=1 if len(audio_data.shape) == 1 else audio_data.shape[1]
-                    )
-                    await self.push_frame(audio_frame, direction)
-                    
-                    # Cleanup temp file
-                    os.unlink(output_path)
-                    
-                else:
-                    print(f"Moshi TTS command failed: {stderr.decode() if stderr else 'Unknown error'}")
-                    
-            except Exception as e:
-                print(f"Error with moshi CLI TTS: {e}")
-                
-            finally:
-                await self.push_frame(TTSStoppedFrame(), direction)
-    
-    async def run_tts(self, text: str) -> AsyncIterator[Frame]:
-        """
-        Required abstract method for TTSService
-        Generate TTS frames using moshi CLI
-        """
-        if not text.strip():
-            return
-            
-        yield TTSStartedFrame()
-        
-        try:
-            # Use temporary file for output
-            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
-                output_path = tmp_file.name
-                
-            # Run moshi TTS command
-            cmd = [
-                'python', '-m', 'moshi.run_inference',
-                '--hf-repo', self.model_repo,
-                '--text', text,
-                '--output', output_path
-            ]
-            
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            
-            stdout, stderr = await process.communicate()
-            
-            if process.returncode == 0 and os.path.exists(output_path):
-                # Read generated audio file
-                import soundfile as sf
-                audio_data, sample_rate = sf.read(output_path)
-                
-                # Convert to the expected format
-                if audio_data.dtype != np.float32:
-                    audio_data = audio_data.astype(np.float32)
-                    
-                # Send as audio frame
-                audio_frame = OutputAudioRawFrame(
-                    audio=audio_data.tobytes(),
-                    sample_rate=sample_rate,
-                    num_channels=1 if len(audio_data.shape) == 1 else audio_data.shape[1]
-                )
-                yield audio_frame
-                
-                # Cleanup temp file
-                os.unlink(output_path)
-                
             else:
-                print(f"Moshi TTS command failed: {stderr.decode() if stderr else 'Unknown error'}")
-                
+                logger.warning("TTS generated empty audio")
+
         except Exception as e:
-            print(f"Error with moshi CLI TTS: {e}")
-            
+            logger.error(f"TTS generation error: {e}")
         finally:
             yield TTSStoppedFrame()
 
+    def _generate_sync(self, text: str) -> Optional[np.ndarray]:
+        """Synchronous TTS generation. Runs in executor thread.
 
-# Test function
-async def test_kyutai_tts():
-    """Test Kyutai TTS service"""
-    print("=== Testing Kyutai TTS Service ===")
-    
-    # Test with simple version first (requires moshi to be installed)
-    try:
-        service = KyutaiTTSServiceSimple()
-        print("KyutaiTTSServiceSimple created successfully")
-        
-        # Note: Full testing requires model files
-        print("To test fully, download model files from:")
-        print("https://huggingface.co/kyutai/tts-1.6b-en_fr")
-        print("https://huggingface.co/kyutai/tts-voices")
-        
-    except Exception as e:
-        print(f"Error creating service: {e}")
+        Returns int16 numpy array of audio samples at 24kHz.
+        """
+        try:
+            entries = self._tts_model.prepare_script([text], padding_between=1)
+            condition_attributes = self._condition_attributes
 
-if __name__ == "__main__":
-    asyncio.run(test_kyutai_tts())
+            pcms = []
+
+            def _on_frame(frame):
+                if (frame != -1).all():
+                    pcm = self._tts_model.mimi.decode(frame[:, 1:, :]).cpu().numpy()
+                    pcms.append(np.clip(pcm[0, 0], -1, 1))
+
+            all_entries = [entries]
+            all_condition_attributes = [condition_attributes]
+            with self._tts_model.mimi.streaming(len(all_entries)):
+                self._tts_model.generate(
+                    all_entries, all_condition_attributes, on_frame=_on_frame
+                )
+
+            if pcms:
+                audio_float = np.concatenate(pcms, axis=-1)
+                # Convert float32 [-1, 1] → int16
+                audio_int16 = (audio_float * 32767).astype(np.int16)
+                return audio_int16
+            return None
+
+        except Exception as e:
+            logger.error(f"Kyutai TTS sync generation error: {e}")
+            return None
+
+    async def cancel(self, frame):
+        """Handle cancel frame."""
+        await super().cancel(frame)
+
+    def can_generate_metrics(self) -> bool:
+        return True

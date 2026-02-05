@@ -1,150 +1,247 @@
-# Voice Pipeline v2 - Pipecat Edition
+# Voice Pipeline v2 — Pipecat Edition
 
-A next-generation voice conversation pipeline for Discord using **Pipecat** orchestration and **Kyutai TTS 1.6B** for speech synthesis. This replaces the hand-rolled v1 pipeline with proper turn-taking, interruption handling, and streaming.
+Real-time voice conversation with Claude via Discord voice channels.
+
+**Pipeline:** Discord mic → VAD → Whisper STT → Clawdbot LLM → Kyutai TTS → Discord speaker
+
+## Quick Start
+
+```bash
+cd /home/anna/clawd/voice-pipeline/v2
+source venv/bin/activate
+VOICE_BOT_TOKEN="$(cat /home/anna/clawd/voice-pipeline/.voice-bot-token)" python3 voice_bot_v2.py
+```
+
+The bot auto-joins when Anna joins a voice channel, auto-leaves when the channel empties.
 
 ## Architecture
 
 ```
-Discord Voice Channel (py-cord, 48kHz stereo PCM)
-  ↕️
-Custom Pipecat Discord Transport Adapter
-  ↓
-Pipecat Pipeline:
-  → Silero VAD Processor (voice activity detection)
-  → faster-whisper large-v3 STT Service (CUDA, float16)
-  → LiveKit EOU Turn Detector (optional, CPU-based, 135M)
-  → Clawdbot LLM Service (subprocess: clawdbot agent --session-id voice --json)
-  → Kyutai TTS 1.6B Service (streaming, CUDA)
-  ↓
-Discord Audio Output
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         Pipecat Pipeline                                │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Discord Voice ──┐                                                      │
+│  (48kHz stereo)  │                                                      │
+│                  ▼                                                      │
+│         ┌────────────────┐                                              │
+│         │ DiscordInput   │  Resample 48kHz stereo → 16kHz mono         │
+│         │ Transport      │  Thread-safe queue bridging                  │
+│         └───────┬────────┘                                              │
+│                 │                                                       │
+│                 ▼                                                       │
+│         ┌────────────────┐                                              │
+│         │ VADProcessor   │  Silero VAD — detects speech start/stop     │
+│         │                │  Triggers transcription on silence           │
+│         └───────┬────────┘                                              │
+│                 │                                                       │
+│                 ▼                                                       │
+│         ┌────────────────┐                                              │
+│         │ WhisperSTT     │  faster-whisper large-v3 (float16, CUDA)    │
+│         │ Service        │  ~0.3s transcription latency                 │
+│         └───────┬────────┘                                              │
+│                 │ TranscriptionFrame                                    │
+│                 ▼                                                       │
+│         ┌────────────────┐                                              │
+│         │ ClawdbotLLM    │  Routes through `clawdbot agent`            │
+│         │ Service        │  Full context: SOUL.md, memory, tools       │
+│         └───────┬────────┘                                              │
+│                 │ LLMTextFrame                                          │
+│                 ▼                                                       │
+│         ┌────────────────┐                                              │
+│         │ KyutaiTTS      │  Kyutai TTS 1.6B (n_q=8)                     │
+│         │ Service        │  ~6x realtime, 24kHz output                  │
+│         └───────┬────────┘                                              │
+│                 │ TTSAudioRawFrame                                      │
+│                 ▼                                                       │
+│         ┌────────────────┐                                              │
+│         │ DiscordOutput  │  Resample 24kHz mono → 48kHz stereo         │
+│         │ Transport      │  Volume scaling (30% default)                │
+│         └───────┬────────┘                                              │
+│                 │                                                       │
+│                 ▼                                                       │
+│         Discord Voice                                                   │
+│         (48kHz stereo)                                                  │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Key Components
+## Components
 
-### 1. Discord Transport Adapter (`discord_transport.py`)
-- **Novel Component**: Bridges py-cord's audio I/O with Pipecat's frame protocol
-- Handles 48kHz stereo ↔ Pipecat's internal audio format conversion
-- Manages Discord bot connection and voice channel lifecycle
-- This is the most technically challenging part since Pipecat doesn't have native Discord support
+### `voice_bot_v2.py`
+Main entry point. Creates the Pipecat pipeline and runs the Discord bot.
 
-### 2. Kyutai TTS Integration (`kyutai_tts_service.py`)
-- **Model**: `kyutai/tts-1.6b-en_fr` (HuggingFace)
-- **Codec**: Mimi for high-quality audio generation
-- **Streaming**: True token-level streaming (starts playing before full text complete)
-- **VRAM**: ~5GB allocation
-- **Hardware**: CUDA, float16 (Blackwell GPU compatible)
+**Configuration constants:**
+- `GUILD_ID` — Discord server ID
+- `AUTO_JOIN_USER_ID` — User to follow into voice channels (Anna's ID)
+- `PIPELINE_SAMPLE_RATE_IN/OUT` — 16kHz input, 24kHz output
 
-### 3. Clawdbot LLM Service (`clawdbot_llm_service.py`)
-- Routes through `clawdbot agent --session-id voice --json --timeout 30`
-- Preserves full Claude session: SOUL.md, memory, tools, identity
-- Subprocess management with proper timeout handling
-- Same Claude instance as text chats
+### `components/discord_transport.py`
+Custom Pipecat transport for Discord voice. Three classes:
 
-### 4. Pipeline Orchestration (`voice_bot_v2.py`)
-- Main entry point that wires everything together
-- Pipecat pipeline configuration and startup
-- Error handling and recovery
-- Discord bot lifecycle management
+**`DiscordTransport`** — Main transport, implements `BaseTransport`:
+- Creates Discord bot with py-cord
+- Auto-joins when target user enters voice
+- Auto-leaves when channel empties
+- Provides `input()` and `output()` methods for the pipeline
 
-## Hardware Requirements
+**`DiscordInputTransport`** — Extends `BaseInputTransport`:
+- Receives 48kHz stereo PCM from Discord's voice recv thread
+- Resamples to 16kHz mono for the pipeline
+- Thread-safe bridging via asyncio queue + `call_soon_threadsafe()`
 
-- **GPU**: RTX 5070 Ti (16GB VRAM, Blackwell architecture)
-- **VRAM Budget**: faster-whisper (~4GB) + Kyutai TTS (~5GB) = ~9-10GB used
-- **CPU**: Ryzen 9 7900X3D, 64GB RAM
-- **OS**: Ubuntu 22.04, Python 3.10, CUDA available
+**`DiscordOutputTransport`** — Extends `BaseOutputTransport`:
+- Receives 24kHz mono PCM from TTS
+- Resamples to 48kHz stereo for Discord
+- Volume scaling (default 30%) to avoid blasting eardrums
+- Lazy playback start (avoids green "speaking" outline when idle)
 
-## Installation
+**Key fix:** Both transports explicitly call `set_transport_ready()` in their `start()` methods. Pipecat's base classes create critical queues in `set_transport_ready()`, but it may not be called automatically for custom transports. Without this, audio frames get silently dropped.
 
+### `components/clawdbot_llm_service.py`
+Routes LLM requests through the Clawdbot agent subprocess.
+
+- Extends `AIService` (not `LLMService`) to avoid OpenAI-style context overhead
+- Handles `TranscriptionFrame` directly from STT
+- Prepends voice hint: tells Claude this is a voice conversation, no markdown
+- Emits `LLMTextFrame` for TTS to consume
+- 30-second timeout with graceful error messages
+
+**Voice hint:**
+```
+[Voice conversation — you're talking live with Anna in a Discord voice channel.
+Write naturally for speech: contractions, casual phrasing, no markdown/formatting/lists.
+Talk like a real person would. Your response will be spoken aloud via TTS.]
+```
+
+### `components/kyutai_tts_service.py`
+Kyutai TTS 1.6B text-to-speech service.
+
+- Extends `TTSService` properly (implements `run_tts()` abstract method)
+- Outputs 24kHz int16 PCM via `TTSAudioRawFrame`
+- Lazy model loading (first TTS request takes ~5s, subsequent requests are fast)
+- Streams audio in ~100ms chunks for responsive playback
+
+**Configuration:**
+- `n_q=8` — Fewer quantization steps = faster (5.28x realtime vs 1.74x at n_q=32)
+- `voice` — Reference voice for cloning (default: `expresso/ex03-ex01_awe_001_channel1_1323s.wav`)
+- `temp=0.6` — Generation temperature
+- `cfg_coef=2.0` — Classifier-free guidance coefficient
+
+## Changing the Voice
+
+Edit `KYUTAI_VOICE` in `components/kyutai_tts_service.py`:
+
+```python
+KYUTAI_VOICE = "expresso/ex03-ex01_awe_001_channel1_1323s.wav"  # Current
+```
+
+Available voices are in the `kyutai/tts-voices` HuggingFace repo. Run `sample_voices_kyutai.py` to generate comparison samples.
+
+**Good options:**
+- `expresso/ex03-ex01_awe_001_channel1_1323s.wav` — wonder/curiosity (current, 1323s reference)
+- `expresso/ex03-ex01_calm_001_channel1_1143s.wav` — warm, relaxed
+- `expresso/ex03-ex02_narration_001_channel1_674s.wav` — storytelling
+- `alba-mackenna/casual.wav` — conversational
+
+Longer reference clips (the `_Xs.wav` suffix is duration) give better voice cloning quality.
+
+## Changing the Volume
+
+Edit `resample_pipeline_to_discord()` in `components/discord_transport.py`:
+
+```python
+def resample_pipeline_to_discord(pcm_data: bytes, source_rate: int, volume: float = 0.3) -> bytes:
+```
+
+Values: 0.0 (silent) to 1.0 (full volume). Default 0.3 is comfortable.
+
+## Performance
+
+Benchmarked on RTX 5070 Ti (16GB VRAM):
+
+| Component | Latency | Notes |
+|-----------|---------|-------|
+| VAD | ~200ms | Wait for speech to stop |
+| STT | ~300ms | faster-whisper large-v3 |
+| LLM | ~4-6s | Claude Opus thinking time |
+| TTS | ~3s for 18s audio | 6x realtime |
+| **Total** | **~8-10s** | From end of speech to start of response |
+
+**VRAM usage:** ~8GB total (Whisper + Kyutai TTS)
+
+## File Structure
+
+```
+voice-pipeline/v2/
+├── voice_bot_v2.py          # Main entry point
+├── components/
+│   ├── discord_transport.py # Discord ↔ Pipecat bridging
+│   ├── clawdbot_llm_service.py # Clawdbot agent integration
+│   └── kyutai_tts_service.py   # Kyutai TTS 1.6B
+├── benchmarks/              # Speed benchmarks
+├── voice_samples/           # Generated voice comparison samples
+├── models/                  # Cached model weights
+├── logs/                    # Runtime logs
+├── venv/                    # Python virtual environment
+└── requirements.txt         # Dependencies
+```
+
+## Dependencies
+
+Key packages (see `requirements.txt` for full list):
+- `pipecat-ai[silero,whisper]==0.0.101` — Pipeline framework
+- `py-cord[voice]` — Discord API
+- `moshi` — Kyutai TTS model
+- `faster-whisper` — STT
+- `torch` — GPU inference
+
+## Known Issues
+
+1. **First TTS request is slow (~5s)** — Model loading happens on first request. Subsequent requests are fast.
+
+2. **Audio not received warnings** — Normal when voice channel is quiet. Pipecat warns about audio timeouts but continues working.
+
+3. **int8 compute type doesn't work** — RTX 5070 Ti (Blackwell) has compatibility issues. Use float16.
+
+## Troubleshooting
+
+**Bot doesn't join voice channel:**
+- Check `VOICE_BOT_TOKEN` is set
+- Verify `AUTO_JOIN_USER_ID` matches Anna's Discord ID
+- Check bot has voice permissions in the server
+
+**Audio not playing:**
+- Check logs for `set_transport_ready` — if missing, the output queue isn't initialized
+- Verify volume isn't 0.0
+
+**STT not transcribing:**
+- Check VAD is detecting speech (look for `VADUserStarted/StoppedSpeakingFrame` in debug logs)
+- Verify microphone is working in Discord
+
+**High latency:**
+- LLM thinking time is the main bottleneck (~4-6s with Opus)
+- Consider using a faster model for voice (Sonnet, Haiku)
+
+## Development
+
+**Run with debug logging:**
 ```bash
-cd /home/anna/clawd/voice-pipeline/v2/
-source venv/bin/activate
-pip install -r requirements.txt
+LOGURU_LEVEL=DEBUG VOICE_BOT_TOKEN="..." python3 voice_bot_v2.py
 ```
 
-## Configuration
-
-- **Discord Bot Token**: Set `VOICE_BOT_TOKEN` environment variable
-- **Guild ID**: 1465514323291144377
-- **Auto-join User**: 1411361963308613867 (Anna)
-
-## Usage
-
+**Generate voice samples:**
 ```bash
-python voice_bot_v2.py
+python3 sample_voices_kyutai.py
+# Samples saved to voice_samples/
 ```
 
-The bot will:
-1. Connect to Discord
-2. Join the voice channel when Anna joins
-3. Listen for speech, transcribe, get Claude response, speak back
-4. Handle interruptions gracefully via Pipecat's built-in turn management
-
-## Implementation Status
-
-### ✅ Completed
-- [x] Virtual environment setup
-- [x] Pipecat installation and exploration
-- [x] Architecture design
-
-### 🚧 In Progress
-- [ ] Discord transport adapter implementation
-- [ ] Kyutai TTS service integration
-- [ ] Clawdbot LLM service wrapper
-
-### ⏳ TODO  
-- [ ] Pipeline wiring and orchestration
-- [ ] Component testing scripts
-- [ ] Integration testing
-- [ ] Performance optimization
-
-## Design Decisions
-
-### Why Pipecat?
-- **Turn Management**: Built-in interruption handling and turn detection
-- **Streaming**: Proper streaming audio pipeline
-- **Modularity**: Clean separation of concerns with processors/services
-- **Audio Processing**: Advanced VAD and audio handling capabilities
-
-### Why Kyutai TTS 1.6B?
-- **Quality**: State-of-the-art neural codec (Mimi)
-- **Streaming**: True token-level streaming for low latency
-- **Size**: Efficient 1.6B parameters fit comfortably in VRAM budget
-- **Multilingual**: English/French support
-
-### Fallback Plans
-If Pipecat Discord integration proves impossible:
-- Use Pipecat as library for internal processing (VAD, turn detection, streaming)
-- Keep py-cord for Discord I/O layer
-- Bridge the two with custom adapters
-
-If Kyutai TTS has issues:
-- **Primary Fallback**: Dia2 1B TTS
-- **Secondary Fallback**: Existing Orpheus TTS daemon (`/tmp/orpheus-tts.sock`)
-
-## Technical Notes
-
-### CRITICAL Hardware Constraints
-- **NO int8 compute type** - Blackwell GPU incompatibility. Use float16/bfloat16 only.
-- **vLLM Import Order** - If using vLLM, import BEFORE torch to avoid EngineCore deadlock
-
-### Discord Audio Format
-- **Input**: 48kHz stereo PCM from Discord Opus decoder
-- **Processing**: Convert to Pipecat's preferred format (likely 16kHz mono)
-- **Output**: Upsample back to 48kHz stereo for Discord Opus encoder
-
-### Memory Management
-- Streaming pipeline must balance memory usage vs latency
-- ~10-11GB VRAM budget leaves 5-6GB for other processes
-- Monitor VRAM usage during development
-
-## Development Log
-
-See git commits for detailed development progress. Key milestones:
-- Initial Pipecat exploration and architecture design
-- Discord transport adapter implementation
-- TTS service integration
-- Full pipeline testing and optimization
+**Run benchmarks:**
+```bash
+python3 benchmarks/benchmark_kyutai.py
+# Results in benchmarks/kyutai_speed_results.md
+```
 
 ---
 
-*This pipeline represents the evolution from v1's hand-rolled implementation to a production-ready, Pipecat-orchestrated solution that handles edge cases properly and provides a foundation for future enhancements.*
+*Built Feb 4, 2026 by Claude & Anna. Four late nights, countless "it's not working" moments, one working voice bot.*

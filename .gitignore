@@ -46,4 +46,4 @@ Thumbs.db
 *.swo
 
 # Test outputs
-test_output/
+test_output/voice_samples/
