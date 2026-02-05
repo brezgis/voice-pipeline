@@ -16,15 +16,21 @@ Usage:
   cd /home/anna/clawd/voice-pipeline/v2
   source venv/bin/activate
   python voice_bot_v2.py
+
+Configuration (environment variables):
+  VOICE_BOT_TOKEN      - Discord bot token (required)
+  DISCORD_GUILD_ID     - Server ID (default: Anna's server)
+  DISCORD_AUTO_JOIN_USER - User ID to follow into voice (default: Anna)
+  VAD_STOP_SECS        - Silence duration before processing (default: 1.5)
 """
 
 import asyncio
 import os
 import sys
-import signal
 from pathlib import Path
 
 from loguru import logger
+from pipecat.audio.vad.vad_analyzer import VADParams
 
 # Ensure components/ is importable
 sys.path.insert(0, str(Path(__file__).parent / "components"))
@@ -42,11 +48,27 @@ from discord_transport import DiscordTransport
 from clawdbot_llm_service import ClawdbotLLMService
 from kyutai_tts_service import KyutaiTTSService
 
-# Configuration
-GUILD_ID = 1465514323291144377
-AUTO_JOIN_USER_ID = 1411361963308613867  # Anna
+# =============================================================================
+# Configuration — override via environment variables
+# =============================================================================
+
+# Discord server and user to follow
+DEFAULT_GUILD_ID = 1465514323291144377  # Anna's server
+DEFAULT_AUTO_JOIN_USER_ID = 1411361963308613867  # Anna
+
+GUILD_ID = int(os.getenv("DISCORD_GUILD_ID", str(DEFAULT_GUILD_ID)))
+AUTO_JOIN_USER_ID = int(os.getenv("DISCORD_AUTO_JOIN_USER", str(DEFAULT_AUTO_JOIN_USER_ID)))
+
+# Audio pipeline settings
 PIPELINE_SAMPLE_RATE_IN = 16000
 PIPELINE_SAMPLE_RATE_OUT = 24000  # Kyutai TTS outputs 24kHz
+
+# VAD settings — how long to wait after speech stops before processing
+# Higher = fewer cut-offs, but slower response time
+VAD_CONFIDENCE = 0.7
+VAD_START_SECS = 0.2  # How long speech must last to trigger
+VAD_STOP_SECS = float(os.getenv("VAD_STOP_SECS", "1.5"))  # Silence before processing
+VAD_MIN_VOLUME = 0.6
 
 
 async def main():
@@ -60,6 +82,9 @@ async def main():
     logger.info("Voice Bot v2 — Pipecat Edition")
     logger.info("Pipeline: Discord → VAD → Whisper STT → Clawdbot → Kyutai TTS → Discord")
     logger.info("=" * 60)
+    logger.info(f"Guild ID: {GUILD_ID}")
+    logger.info(f"Auto-join user: {AUTO_JOIN_USER_ID}")
+    logger.info(f"VAD stop seconds: {VAD_STOP_SECS}")
 
     # --- Check prerequisites ---
     try:
@@ -85,10 +110,16 @@ async def main():
     # --- Create pipeline processors ---
 
     # VAD: Silero-based voice activity detection
-    vad = VADProcessor(vad_analyzer=SileroVADAnalyzer())
+    # Longer stop_secs = wait longer after speech stops before processing
+    vad_params = VADParams(
+        confidence=VAD_CONFIDENCE,
+        start_secs=VAD_START_SECS,
+        stop_secs=VAD_STOP_SECS,
+        min_volume=VAD_MIN_VOLUME,
+    )
+    vad = VADProcessor(vad_analyzer=SileroVADAnalyzer(params=vad_params))
 
     # STT: faster-whisper large-v3
-    # audio_passthrough=False: no need to push raw audio past STT
     stt = WhisperSTTService(
         model="large-v3",
         device="cuda",
@@ -103,14 +134,13 @@ async def main():
     tts = KyutaiTTSService(n_q=8, device="cuda")
 
     # --- Build pipeline ---
-    # Chain: discord_input → vad → stt → llm → tts → discord_output
     pipeline = Pipeline([
-        transport.input(),   # DiscordInputTransport (BaseInputTransport)
-        vad,                 # VADProcessor → VADUserStarted/StoppedSpeakingFrame
-        stt,                 # WhisperSTTService → TranscriptionFrame
-        llm,                 # ClawdbotLLMService → LLMTextFrame + LLMFullResponseEndFrame
-        tts,                 # KyutaiTTSService → TTSAudioRawFrame
-        transport.output(),  # DiscordOutputTransport (BaseOutputTransport)
+        transport.input(),   # DiscordInputTransport
+        vad,                 # VADProcessor
+        stt,                 # WhisperSTTService
+        llm,                 # ClawdbotLLMService
+        tts,                 # KyutaiTTSService
+        transport.output(),  # DiscordOutputTransport
     ])
 
     # --- Create task ---
@@ -126,9 +156,6 @@ async def main():
     runner = PipelineRunner(handle_sigint=True, handle_sigterm=True)
 
     # --- Start Discord bot concurrently with pipeline runner ---
-    # The Discord bot needs to run alongside the pipeline.
-    # We start the bot in a background task and run the pipeline runner.
-
     bot_task = asyncio.create_task(transport.start_bot())
 
     @task.event_handler("on_pipeline_started")

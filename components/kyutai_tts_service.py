@@ -13,6 +13,7 @@ Benchmarked at 5.28x realtime with n_q=8 on RTX 5070 Ti.
 """
 
 import asyncio
+import gc
 from typing import AsyncGenerator, Optional
 
 import numpy as np
@@ -27,20 +28,30 @@ from pipecat.frames.frames import (
 )
 from pipecat.services.tts_service import TTSService
 
+# =============================================================================
 # Kyutai TTS constants
+# =============================================================================
+
 KYUTAI_SAMPLE_RATE = 24000
 KYUTAI_MODEL_REPO = "kyutai/tts-1.6b-en_fr"
+
+# Voice reference clip for cloning. Longer clips = better quality.
+# See voice_samples/ and sample_voices_kyutai.py for alternatives.
 KYUTAI_VOICE = "expresso/ex03-ex01_awe_001_channel1_1323s.wav"
-KYUTAI_N_Q = 8  # Fewer quantization steps = faster (benchmarked 5.28x RT)
-KYUTAI_TEMP = 0.6
-KYUTAI_CFG_COEF = 2.0
+
+# Performance tuning
+KYUTAI_N_Q = 8       # Codec quantization steps — lower = faster (8 → 5.28x RT, 32 → 1.74x)
+KYUTAI_TEMP = 0.6    # Generation temperature
+KYUTAI_CFG_COEF = 2.0  # Classifier-free guidance strength
+
+# Audio chunking for streaming playback (~100ms chunks)
+TTS_CHUNK_MS = 100
 
 
 class KyutaiTTSService(TTSService):
     """Kyutai TTS 1.6B service for Pipecat.
 
-    Loads from HuggingFace cache (already downloaded from benchmark).
-    Outputs 24kHz mono int16 PCM via TTSAudioRawFrame.
+    Loads from HuggingFace cache. Outputs 24kHz mono int16 PCM.
     """
 
     def __init__(
@@ -54,7 +65,6 @@ class KyutaiTTSService(TTSService):
         device: str = "cuda",
         **kwargs,
     ):
-        # Set sample_rate before calling super().__init__
         super().__init__(sample_rate=KYUTAI_SAMPLE_RATE, **kwargs)
 
         self._model_repo = model_repo
@@ -64,13 +74,13 @@ class KyutaiTTSService(TTSService):
         self._cfg_coef = cfg_coef
         self._device_str = device
 
-        self._tts_model = None
-        self._voice_path = None
-        self._condition_attributes = None
-        self._loaded = False
+        self._tts_model: Optional[object] = None  # moshi.models.tts.TTSModel
+        self._voice_path: Optional[object] = None  # pathlib.Path
+        self._condition_attributes: Optional[object] = None
+        self._loaded: bool = False
 
-    async def _ensure_loaded(self):
-        """Load the model on first use (heavy, ~5GB VRAM)."""
+    async def _ensure_loaded(self) -> None:
+        """Load the model on first use (~5s, ~4GB VRAM)."""
         if self._loaded:
             return
 
@@ -91,14 +101,21 @@ class KyutaiTTSService(TTSService):
             )
             return tts_model, voice_path, condition_attributes
 
-        # Load in thread to avoid blocking the event loop
-        self._tts_model, self._voice_path, self._condition_attributes = (
-            await asyncio.get_event_loop().run_in_executor(None, _load)
-        )
-        self._loaded = True
-
-        vram = torch.cuda.memory_allocated() / 1e9
-        logger.info(f"Kyutai TTS loaded. VRAM: {vram:.2f} GB")
+        try:
+            self._tts_model, self._voice_path, self._condition_attributes = (
+                await asyncio.get_event_loop().run_in_executor(None, _load)
+            )
+            self._loaded = True
+            vram = torch.cuda.memory_allocated() / 1e9
+            logger.info(f"Kyutai TTS loaded. VRAM: {vram:.2f} GB")
+        except Exception:
+            # Clean up partial state on failure
+            self._tts_model = None
+            self._voice_path = None
+            self._condition_attributes = None
+            gc.collect()
+            torch.cuda.empty_cache()
+            raise
 
     async def run_tts(self, text: str) -> AsyncGenerator[Frame, None]:
         """Generate speech from text, yielding TTSAudioRawFrame chunks.
@@ -116,14 +133,12 @@ class KyutaiTTSService(TTSService):
         yield TTSStartedFrame()
 
         try:
-            # Run the actual generation in a thread (it's CPU/GPU bound)
             audio_int16 = await asyncio.get_event_loop().run_in_executor(
                 None, self._generate_sync, text
             )
 
             if audio_int16 is not None and len(audio_int16) > 0:
-                # Chunk the audio for streaming (~100ms chunks)
-                chunk_samples = KYUTAI_SAMPLE_RATE // 10  # 2400 samples = 100ms
+                chunk_samples = KYUTAI_SAMPLE_RATE * TTS_CHUNK_MS // 1000
                 chunk_bytes = chunk_samples * 2  # int16 = 2 bytes per sample
 
                 audio_bytes = audio_int16.tobytes()
@@ -150,25 +165,21 @@ class KyutaiTTSService(TTSService):
         """
         try:
             entries = self._tts_model.prepare_script([text], padding_between=1)
-            condition_attributes = self._condition_attributes
 
-            pcms = []
+            pcms: list[np.ndarray] = []
 
             def _on_frame(frame):
                 if (frame != -1).all():
                     pcm = self._tts_model.mimi.decode(frame[:, 1:, :]).cpu().numpy()
                     pcms.append(np.clip(pcm[0, 0], -1, 1))
 
-            all_entries = [entries]
-            all_condition_attributes = [condition_attributes]
-            with self._tts_model.mimi.streaming(len(all_entries)):
+            with self._tts_model.mimi.streaming(1):
                 self._tts_model.generate(
-                    all_entries, all_condition_attributes, on_frame=_on_frame
+                    [entries], [self._condition_attributes], on_frame=_on_frame
                 )
 
             if pcms:
                 audio_float = np.concatenate(pcms, axis=-1)
-                # Convert float32 [-1, 1] → int16
                 audio_int16 = (audio_float * 32767).astype(np.int16)
                 return audio_int16
             return None
@@ -177,7 +188,7 @@ class KyutaiTTSService(TTSService):
             logger.error(f"Kyutai TTS sync generation error: {e}")
             return None
 
-    async def cancel(self, frame):
+    async def cancel(self, frame: Frame) -> None:
         """Handle cancel frame."""
         await super().cancel(frame)
 
