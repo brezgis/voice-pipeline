@@ -130,8 +130,8 @@ async def test_discord_transport():
         # Create transport (but don't start it)
         transport = DiscordTransport(
             bot_token=token,
-            guild_id=1465514323291144377,
-            auto_join_user_id=1411361963308613867
+            guild_id=0  # Set your guild ID,
+            auto_join_user_id=0  # Set your user ID
         )
         
         print("✓ DiscordTransport created")

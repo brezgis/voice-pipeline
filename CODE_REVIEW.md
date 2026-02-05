@@ -18,12 +18,7 @@ No critical issues. The pipeline works correctly.
 
 #### 1. Hardcoded User ID and Guild ID
 **File:** `voice_bot_v2.py`, `discord_transport.py`
-```python
-GUILD_ID = 1465514323291144377
-AUTO_JOIN_USER_ID = 1411361963308613867  # Anna
-```
-**Issue:** Hardcoded to Anna's server. Won't work elsewhere.
-**Fix:** Move to environment variables or config file.
+**Issue:** Was hardcoded to a specific server. ✅ Fixed — now reads from environment variables.
 ```python
 GUILD_ID = int(os.getenv("DISCORD_GUILD_ID", "0"))
 AUTO_JOIN_USER_ID = int(os.getenv("DISCORD_AUTO_JOIN_USER", "0"))

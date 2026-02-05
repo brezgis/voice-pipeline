@@ -52,12 +52,9 @@ from kyutai_tts_service import KyutaiTTSService
 # Configuration — override via environment variables
 # =============================================================================
 
-# Discord server and user to follow
-DEFAULT_GUILD_ID = 1465514323291144377  # Anna's server
-DEFAULT_AUTO_JOIN_USER_ID = 1411361963308613867  # Anna
-
-GUILD_ID = int(os.getenv("DISCORD_GUILD_ID", str(DEFAULT_GUILD_ID)))
-AUTO_JOIN_USER_ID = int(os.getenv("DISCORD_AUTO_JOIN_USER", str(DEFAULT_AUTO_JOIN_USER_ID)))
+# Discord server and user to follow — set via environment variables
+GUILD_ID = int(os.getenv("DISCORD_GUILD_ID", "0"))
+AUTO_JOIN_USER_ID = int(os.getenv("DISCORD_AUTO_JOIN_USER", "0"))
 
 # Audio pipeline settings
 PIPELINE_SAMPLE_RATE_IN = 16000

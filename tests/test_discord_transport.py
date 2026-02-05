@@ -37,8 +37,8 @@ from discord_transport import (
 )
 
 # Test configuration
-TEST_GUILD_ID = 1465514323291144377
-TEST_USER_ID = 1411361963308613867
+TEST_GUILD_ID = 0  # Set your guild ID
+TEST_USER_ID = 0  # Set your user ID
 
 
 class TestDiscordTransport:
