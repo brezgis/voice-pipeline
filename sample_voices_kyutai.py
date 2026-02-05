@@ -43,7 +43,7 @@ TEST_TEXT = (
     "Want to dig into it more?"
 )
 
-OUTPUT_DIR = Path("/home/anna/clawd/voice-pipeline/v2/voice_samples")
+OUTPUT_DIR = Path("voice_samples")
 
 def main():
     OUTPUT_DIR.mkdir(exist_ok=True)

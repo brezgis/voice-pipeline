@@ -363,5 +363,5 @@ if __name__ == "__main__":
         print("\n" + "="*50)
         print("To test voice channel functionality, run:")
         print("python test_discord_transport.py voice")
-        print("\nMake sure Anna is in a voice channel first!")
+        print("\nMake sure target user is in a voice channel first!")
         print("="*50)

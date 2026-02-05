@@ -113,7 +113,7 @@ Audio samples for quality comparison saved to:
 
 ### Next Steps
 1. **Listen to audio samples** to confirm quality is acceptable
-2. **Test with Anna's preferred voice** samples
+2. **Test with preferred voice** samples
 3. **Benchmark longer text passages** to confirm consistency
 4. **Implement streaming integration** with Discord voice bot
 5. **Production testing** with real voice conversations

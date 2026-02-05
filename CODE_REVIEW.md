@@ -33,10 +33,10 @@ AUTO_JOIN_USER_ID = int(os.getenv("DISCORD_AUTO_JOIN_USER", "0"))
 **File:** `clawdbot_llm_service.py`
 ```python
 VOICE_HINT = (
-    "[Voice conversation — you're talking live with Anna in a Discord voice channel..."
+    "[Voice conversation — you're talking live in a Discord voice channel..."
 )
 ```
-**Issue:** Hardcoded mention of Anna.
+**Issue:** Hardcoded mention of a specific user.
 **Fix:** Make generic or parameterize:
 ```python
 def __init__(self, *, user_name: str = "the user", ...):

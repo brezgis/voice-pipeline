@@ -13,14 +13,14 @@ Uses Pipecat 0.0.101's actual API:
 
 Usage:
   export VOICE_BOT_TOKEN=your_discord_bot_token
-  cd /home/anna/clawd/voice-pipeline/v2
+  cd /path/to/voice-pipeline/v2
   source venv/bin/activate
   python voice_bot_v2.py
 
 Configuration (environment variables):
   VOICE_BOT_TOKEN      - Discord bot token (required)
-  DISCORD_GUILD_ID     - Server ID (default: Anna's server)
-  DISCORD_AUTO_JOIN_USER - User ID to follow into voice (default: Anna)
+  DISCORD_GUILD_ID     - Server ID (default: your server)
+  DISCORD_AUTO_JOIN_USER - User ID to follow into voice (default: unset)
   VAD_STOP_SECS        - Silence duration before processing (default: 1.5)
 """
 

@@ -7,12 +7,12 @@ Real-time voice conversation with Claude via Discord voice channels.
 ## Quick Start
 
 ```bash
-cd /home/anna/clawd/voice-pipeline/v2
+cd /path/to/voice-pipeline/v2
 source venv/bin/activate
-VOICE_BOT_TOKEN="$(cat /home/anna/clawd/voice-pipeline/.voice-bot-token)" python3 voice_bot_v2.py
+VOICE_BOT_TOKEN="$(cat .voice-bot-token)" python3 voice_bot_v2.py
 ```
 
-The bot auto-joins when Anna joins a voice channel, auto-leaves when the channel empties.
+The bot auto-joins when the target user joins a voice channel, auto-leaves when the channel empties.
 
 ## Architecture
 
@@ -73,7 +73,7 @@ Main entry point. Creates the Pipecat pipeline and runs the Discord bot.
 
 **Configuration constants:**
 - `GUILD_ID` — Discord server ID
-- `AUTO_JOIN_USER_ID` — User to follow into voice channels (Anna's ID)
+- `AUTO_JOIN_USER_ID` — User to follow into voice channels (target user's ID)
 - `PIPELINE_SAMPLE_RATE_IN/OUT` — 16kHz input, 24kHz output
 
 ### `components/discord_transport.py`
@@ -109,7 +109,7 @@ Routes LLM requests through the Clawdbot agent subprocess.
 
 **Voice hint:**
 ```
-[Voice conversation — you're talking live with Anna in a Discord voice channel.
+[Voice conversation — you're talking live in a Discord voice channel.
 Write naturally for speech: contractions, casual phrasing, no markdown/formatting/lists.
 Talk like a real person would. Your response will be spoken aloud via TTS.]
 ```
@@ -208,7 +208,7 @@ Key packages (see `requirements.txt` for full list):
 
 **Bot doesn't join voice channel:**
 - Check `VOICE_BOT_TOKEN` is set
-- Verify `AUTO_JOIN_USER_ID` matches Anna's Discord ID
+- Verify `AUTO_JOIN_USER_ID` matches the target user's Discord ID
 - Check bot has voice permissions in the server
 
 **Audio not playing:**
@@ -244,4 +244,4 @@ python3 benchmarks/benchmark_kyutai.py
 
 ---
 
-*Built Feb 4, 2026 by Claude & Anna. Four late nights, countless "it's not working" moments, one working voice bot.*
+*Built Feb 4, 2026.*
