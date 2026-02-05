@@ -1,0 +1,27 @@
+# Pipecat and core dependencies
+pipecat-ai>=0.0.101
+anthropic>=0.77.1
+websockets>=16.0
+
+# Discord integration
+py-cord>=2.7.0
+
+# Audio processing
+faster-whisper>=1.2.1
+torch>=2.10.0
+torchaudio
+transformers>=5.0.0
+accelerate>=1.12.0
+
+# Kyutai TTS dependencies
+moshi>=0.2.6
+
+# Audio utilities
+numpy>=2.2.0
+scipy
+soundfile
+
+# General utilities
+asyncio
+aiohttp
+pydantic

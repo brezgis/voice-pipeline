@@ -1,0 +1,49 @@
+# Virtual environment
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Model files (large)
+models/
+*.safetensors
+*.bin
+*.pt
+
+# Audio files
+*.wav
+*.mp3
+*.ogg
+*.flac
+
+# Logs
+logs/
+*.log
+
+# Secrets
+.env
+*.token
+*token*
+
+# Temporary files
+temp/
+tmp/
+*.tmp
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test outputs
+test_output/
