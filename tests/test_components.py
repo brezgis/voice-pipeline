@@ -93,11 +93,11 @@ async def test_kyutai_tts():
     print("\\n=== Testing Kyutai TTS ===")
     
     try:
-        from kyutai_tts_service import KyutaiTTSServiceSimple
+        from kyutai_tts_service import KyutaiTTSService
         
-        # Create simple service (doesn't need local models)
-        service = KyutaiTTSServiceSimple()
-        print("✓ KyutaiTTSServiceSimple created")
+        # Create service (model loads lazily on first use)
+        service = KyutaiTTSService()
+        print("✓ KyutaiTTSService created")
         
         # Check if moshi is working
         import moshi
@@ -130,8 +130,8 @@ async def test_discord_transport():
         # Create transport (but don't start it)
         transport = DiscordTransport(
             bot_token=token,
-            guild_id=0  # Set your guild ID,
-            auto_join_user_id=0  # Set your user ID
+            guild_id=0,  # Set your guild ID
+            auto_join_user_id=0,  # Set your user ID
         )
         
         print("✓ DiscordTransport created")

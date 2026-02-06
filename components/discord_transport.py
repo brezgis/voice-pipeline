@@ -272,13 +272,20 @@ class DiscordOutputTransport(BaseOutputTransport):
         if not self._audio_source:
             return False
 
-        # Start playback on first audio frame (avoids green outline when idle)
-        if not self._playback_started and self._transport and self._transport._voice_client:
+        if self._transport and self._transport._voice_client:
             vc = self._transport._voice_client
-            if not vc.is_playing():
+
+            if not self._playback_started:
+                # Start playback on first audio frame (avoids green outline when idle)
+                if not vc.is_playing():
+                    self._audio_source.reset()
+                    vc.play(self._audio_source)
+                    self._playback_started = True
+            elif not vc.is_playing():
+                # Playback stopped (previous TTS finished) — restart for new audio.
+                # Without this reset, the bot goes silent after the first response.
                 self._audio_source.reset()
                 vc.play(self._audio_source)
-                self._playback_started = True
 
         discord_audio = resample_pipeline_to_discord(frame.audio, frame.sample_rate)
         self._audio_source.feed(discord_audio)
@@ -411,7 +418,7 @@ class DiscordTransport(BaseTransport):
             # Setup recording sink → feeds our input transport
             self._audio_sink = DiscordAudioSink(self._input_transport)
 
-            async def _on_stop(sink, ctx):
+            async def _on_stop(*args, **kwargs):
                 pass
 
             self._voice_client.start_recording(self._audio_sink, _on_stop, None)

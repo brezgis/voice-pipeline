@@ -18,7 +18,7 @@ from typing import Dict, Any, List, Tuple
 import gc
 
 # Add the parent directory to Python path to import moshi
-sys.path.append('/path/to/voice-pipeline/v2')
+sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 try:
     from moshi.models.loaders import CheckpointInfo
@@ -359,9 +359,10 @@ def main():
     """Main benchmark execution"""
     
     # Check environment
-    if not os.path.exists('/path/to/voice-pipeline/v2/venv'):
+    v2_dir = Path(__file__).resolve().parent.parent
+    if not os.path.exists(v2_dir / 'venv'):
         print("ERROR: v2 virtual environment not found!")
-        print("Please run: source /path/to/voice-pipeline/v2/venv/bin/activate")
+        print(f"Please run: source {v2_dir}/venv/bin/activate")
         sys.exit(1)
     
     # Check CUDA availability
@@ -384,7 +385,7 @@ def main():
         results = benchmark.run_all_benchmarks()
         
         # Save detailed results to JSON
-        results_file = '/path/to/voice-pipeline/v2/benchmarks/kyutai_benchmark_results.json'
+        results_file = str(Path(__file__).resolve().parent / 'kyutai_benchmark_results.json')
         with open(results_file, 'w') as f:
             json.dump(results, f, indent=2)
         print(f"\nDetailed results saved to: {results_file}")

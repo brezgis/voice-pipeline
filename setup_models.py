@@ -42,8 +42,8 @@ def download_with_git_lfs(repo_url, target_dir):
     if result is None:
         return False
         
-    # Pull LFS files
-    cmd = ["git", "lfs", "pull"]
+    # Pull LFS files (must run inside the cloned repo directory)
+    cmd = ["git", "-C", target_dir, "lfs", "pull"]
     result = run_command(cmd, f"Pulling LFS files in {target_dir}")
     
     return result is not None
@@ -177,16 +177,16 @@ import sys
 from pathlib import Path
 sys.path.append(str(Path(__file__).parent / "components"))
 
-from kyutai_tts_service import KyutaiTTSService, KyutaiTTSServiceSimple
+from kyutai_tts_service import KyutaiTTSService
 
 async def test_models():
     """Test the downloaded models"""
     print("=== Testing Kyutai TTS Models ===")
     
-    # Test simple version first
+    # Test service creation (model loads lazily)
     try:
-        service = KyutaiTTSServiceSimple()
-        print("✓ KyutaiTTSServiceSimple created")
+        service = KyutaiTTSService()
+        print("✓ KyutaiTTSService created")
         
         # Test basic functionality
         test_text = "Hello, this is a test of the Kyutai TTS system."

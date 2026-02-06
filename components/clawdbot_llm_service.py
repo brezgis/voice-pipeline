@@ -2,8 +2,8 @@
 """
 Clawdbot LLM Service for Pipecat v2
 
-Routes LLM requests through `clawdbot agent --session-id voice --json --timeout 30`
-so the voice bot gets full Clawdbot context (SOUL.md, memory, tools, identity).
+Routes LLM requests through `openclaw agent --session-id voice --json --timeout 30`
+so the voice bot gets full OpenClaw context (SOUL.md, memory, tools, identity).
 
 This extends Pipecat's AIService:
 - Handles TranscriptionFrame (from STT) directly
@@ -50,7 +50,7 @@ class ClawdbotLLMService(AIService):
     handling, function calling, etc), we extend AIService directly and
     handle the frames we care about: TranscriptionFrame from STT.
 
-    Flow: TranscriptionFrame → clawdbot agent → LLMTextFrame chunks → TTS
+    Flow: TranscriptionFrame → openclaw agent → LLMTextFrame chunks → TTS
     """
 
     def __init__(
@@ -139,18 +139,25 @@ class ClawdbotLLMService(AIService):
             logger.warning(f"Failed to log transcript: {e}")
 
     async def _run_clawdbot(self, prompt: str) -> None:
-        """Run clawdbot agent and parse response as LLMTextFrame."""
+        """Run openclaw agent and parse response as LLMTextFrame.
+        
+        NOTE: Message is passed via -m flag which is visible in /proc/cmdline.
+        openclaw agent does not support stdin message input. On this single-user
+        system this is acceptable; on shared systems, consider proxying through
+        the gateway API instead of the CLI.
+        """
+        msg_text = self._voice_hint + prompt
         cmd = [
-            "clawdbot", "agent",
+            "openclaw", "agent",
             "--session-id", self._session_id,
             "--json",
             "--timeout", str(self._timeout),
-            "-m", self._voice_hint + prompt,
+            "-m", msg_text,
         ]
         if self._model:
             cmd.extend(["--model", self._model])
 
-        logger.debug(f"Running: clawdbot agent --session-id {self._session_id}")
+        logger.debug(f"Running: openclaw agent --session-id {self._session_id}")
 
         t_start = time.monotonic()
 
@@ -170,10 +177,10 @@ class ClawdbotLLMService(AIService):
 
             output = stdout.decode().strip()
             if stderr:
-                logger.debug(f"Clawdbot stderr: {stderr.decode()[:200]}")
+                logger.debug(f"OpenClaw stderr: {stderr.decode()[:200]}")
 
             if not output:
-                logger.warning("Clawdbot returned empty output")
+                logger.warning("OpenClaw returned empty output")
                 await self.push_frame(
                     LLMTextFrame("I'm sorry, I didn't catch that. Could you say that again?")
                 )
@@ -183,14 +190,14 @@ class ClawdbotLLMService(AIService):
             try:
                 data = json.loads(output)
             except json.JSONDecodeError:
-                logger.debug(f"Clawdbot non-JSON output: {output[:200]}")
+                logger.debug(f"OpenClaw non-JSON output: {output[:200]}")
                 await self.push_frame(LLMTextFrame(output))
                 self._log_transcript(prompt, output, think_seconds)
                 return
 
             status = data.get("status", "")
             if status == "error":
-                logger.error(f"Clawdbot error: {data}")
+                logger.error(f"OpenClaw error: {data}")
                 await self.push_frame(
                     LLMTextFrame("Sorry, I had trouble with that.")
                 )
@@ -212,33 +219,34 @@ class ClawdbotLLMService(AIService):
                 full_response = " ".join(response_parts)
                 self._log_transcript(prompt, full_response, think_seconds)
             else:
-                logger.warning(f"No text in clawdbot response: {output[:200]}")
+                logger.warning(f"No text in openclaw response: {output[:200]}")
                 await self.push_frame(
                     LLMTextFrame("I'm sorry, I didn't catch that. Could you say that again?")
                 )
 
         except asyncio.TimeoutError:
-            logger.error("Clawdbot agent timed out")
+            logger.error("OpenClaw agent timed out")
             await self.push_frame(
                 LLMTextFrame("Sorry, I took too long thinking about that.")
             )
         except Exception as e:
-            logger.error(f"Clawdbot communication error: {e}")
+            logger.error(f"OpenClaw communication error: {e}")
             raise
         finally:
-            if self._current_process:
+            proc = self._current_process
+            self._current_process = None
+            if proc and proc.returncode is None:
                 try:
-                    self._current_process.terminate()
-                    await asyncio.wait_for(self._current_process.wait(), timeout=5)
+                    proc.terminate()
+                    await asyncio.wait_for(proc.wait(), timeout=5)
                 except Exception:
                     try:
-                        self._current_process.kill()
+                        proc.kill()
                     except Exception:
                         pass
-            self._current_process = None
 
     async def cancel(self, frame: Frame) -> None:
-        """Cancel any running clawdbot process on pipeline cancel."""
+        """Cancel any running openclaw process on pipeline cancel."""
         await super().cancel(frame)
         if self._current_process:
             try:

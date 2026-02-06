@@ -188,6 +188,18 @@ class KyutaiTTSService(TTSService):
             logger.error(f"Kyutai TTS sync generation error: {e}")
             return None
 
+    async def cleanup(self) -> None:
+        """Release GPU memory when the service is shut down."""
+        if self._tts_model is not None:
+            logger.info("Unloading Kyutai TTS model from VRAM")
+            del self._tts_model
+            self._tts_model = None
+            self._voice_path = None
+            self._condition_attributes = None
+            self._loaded = False
+            gc.collect()
+            torch.cuda.empty_cache()
+
     async def cancel(self, frame: Frame) -> None:
         """Handle cancel frame."""
         await super().cancel(frame)
