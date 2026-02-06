@@ -45,8 +45,14 @@ from pipecat.services.whisper.stt import WhisperSTTService
 
 # Our custom components
 from discord_transport import DiscordTransport
-from clawdbot_llm_service import ClawdbotLLMService
 from kyutai_tts_service import KyutaiTTSService
+
+# LLM service: streaming gateway (default) or blocking CLI fallback
+USE_STREAMING_LLM = os.getenv("VOICE_LLM_STREAMING", "true").lower() in ("true", "1", "yes")
+if USE_STREAMING_LLM:
+    from streaming_gateway_llm_service import StreamingGatewayLLMService
+else:
+    from clawdbot_llm_service import ClawdbotLLMService
 
 # =============================================================================
 # Configuration — override via environment variables
@@ -75,13 +81,15 @@ async def main():
         logger.error("VOICE_BOT_TOKEN environment variable not set")
         sys.exit(1)
 
+    llm_mode = "Streaming Gateway" if USE_STREAMING_LLM else "Clawdbot CLI"
     logger.info("=" * 60)
     logger.info("Voice Bot v2 — Pipecat Edition")
-    logger.info("Pipeline: Discord → VAD → Whisper STT → Clawdbot → Kyutai TTS → Discord")
+    logger.info(f"Pipeline: Discord → VAD → Whisper STT → {llm_mode} → Kyutai TTS → Discord")
     logger.info("=" * 60)
     logger.info(f"Guild ID: {GUILD_ID}")
     logger.info(f"Auto-join user: {AUTO_JOIN_USER_ID}")
     logger.info(f"VAD stop seconds: {VAD_STOP_SECS}")
+    logger.info(f"LLM mode: {llm_mode}")
 
     # --- Check prerequisites ---
     try:
@@ -124,8 +132,11 @@ async def main():
         audio_passthrough=False,
     )
 
-    # LLM: Route through Clawdbot agent
-    llm = ClawdbotLLMService(session_id="voice", timeout=30)
+    # LLM: Streaming gateway (default) or blocking CLI fallback
+    if USE_STREAMING_LLM:
+        llm = StreamingGatewayLLMService(session_id="voice", timeout=30)
+    else:
+        llm = ClawdbotLLMService(session_id="voice", timeout=30)
 
     # TTS: Kyutai TTS 1.6B
     tts = KyutaiTTSService(n_q=8, device="cuda")
