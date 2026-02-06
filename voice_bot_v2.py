@@ -237,7 +237,11 @@ async def main():
         allow_interruptions=True,
     )
 
-    task = PipelineTask(pipeline, params=params)
+    task = PipelineTask(
+        pipeline,
+        params=params,
+        idle_timeout_secs=None,  # Never kill pipeline on idle — we handle join/leave via Discord events
+    )
 
     # --- Create runner ---
     runner = PipelineRunner(handle_sigint=True, handle_sigterm=True)

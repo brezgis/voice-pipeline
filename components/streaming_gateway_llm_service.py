@@ -19,6 +19,7 @@ OpenClaw context.
 Estimated latency savings vs ClawdbotLLMService: 1500-3000ms.
 """
 
+import asyncio
 import json
 import os
 import time
@@ -185,6 +186,7 @@ class StreamingGatewayLLMService(AIService):
         t_start = time.monotonic()
         full_response_parts: list[str] = []
         first_token_time: Optional[float] = None
+        buffer_flushed = False  # Track whether early-buffered tokens were pushed
 
         try:
             async with session.post(self._gateway_url, json=payload) as resp:
@@ -234,7 +236,32 @@ class StreamingGatewayLLMService(AIService):
                             logger.info(f"StreamingGatewayLLM TTFT: {ttft:.2f}s")
 
                         full_response_parts.append(content)
-                        await self.push_frame(LLMTextFrame(content))
+
+                        # Buffer early tokens to detect NO_REPLY/HEARTBEAT_OK
+                        # before pushing anything to TTS. Once we have enough
+                        # chars to know it's not a silent signal, flush buffer.
+                        accumulated = "".join(full_response_parts)
+                        _SILENT_SIGNALS = ("NO_REPLY", "HEARTBEAT_OK")
+                        if len(accumulated) <= 14:  # max len of signals
+                            # Could still be a silent signal — check prefix
+                            is_prefix = any(
+                                s.startswith(accumulated.strip())
+                                for s in _SILENT_SIGNALS
+                            )
+                            if is_prefix:
+                                continue  # hold back, don't push to TTS yet
+                            else:
+                                # Not a silent signal prefix — flush all buffered
+                                for part in full_response_parts:
+                                    await self.push_frame(LLMTextFrame(part))
+                                buffer_flushed = True
+                        else:
+                            if not buffer_flushed:
+                                # First token past the 14-char threshold — flush buffer
+                                for part in full_response_parts[:-1]:
+                                    await self.push_frame(LLMTextFrame(part))
+                                buffer_flushed = True
+                            await self.push_frame(LLMTextFrame(content))
 
                     # Check for finish_reason
                     finish_reason = choices[0].get("finish_reason")
@@ -259,6 +286,23 @@ class StreamingGatewayLLMService(AIService):
 
         elapsed = time.monotonic() - t_start
         response_text = "".join(full_response_parts)
+
+        # Filter out NO_REPLY / HEARTBEAT_OK — these are OpenClaw silent signals,
+        # not something to speak aloud.
+        if response_text and response_text.strip() in ("NO_REPLY", "HEARTBEAT_OK"):
+            logger.info(
+                f"StreamingGatewayLLM suppressed silent reply: {response_text.strip()} "
+                f"({elapsed:.1f}s)"
+            )
+            return
+
+        # Flush any buffered tokens that were held back during prefix detection.
+        # This handles short non-signal responses (e.g., "Nope!") where the buffer
+        # was never flushed because accumulated length stayed ≤ 14 chars.
+        if full_response_parts and not buffer_flushed:
+            for part in full_response_parts:
+                await self.push_frame(LLMTextFrame(part))
+            buffer_flushed = True
 
         if response_text:
             logger.info(

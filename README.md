@@ -17,7 +17,7 @@ Discord mic (48kHz stereo)
          │
          ▼
 ┌──────────────────┐
-│ Silero VAD       │  Voice activity detection (0.8s stop threshold)
+│ Silero VAD       │  Voice activity detection (0.2s stop with SmartTurn)
 │                  │  Detects speech start/stop, triggers STT on silence
 └────────┬─────────┘
          │
@@ -96,6 +96,10 @@ Creates the Pipecat pipeline and runs the Discord bot. Configurable via environm
 
 SSE streaming via the OpenClaw gateway's OpenAI-compatible `/v1/chat/completions` endpoint. Emits tokens as `LLMTextFrame`s for sentence-level TTS streaming. Maintains conversation history for multi-turn context.
 
+**Silent signal filtering:** OpenClaw may respond with `NO_REPLY` or `HEARTBEAT_OK` — internal signals meaning "nothing to say." These are intercepted before reaching TTS:
+- **Streaming buffer:** The first ~14 characters are held back to detect signal prefixes before any tokens reach the TTS sentence aggregator. Once the response exceeds the signal length or diverges from a signal prefix, all buffered tokens are flushed at once.
+- **Post-stream filter:** After the full response is assembled, a final check catches any signal that slipped through (e.g., if tokens arrived in unexpected chunks).
+
 Reads auth token from `OPENCLAW_TOKEN` env var or `~/.openclaw/openclaw.json`.
 
 ### `components/clawdbot_llm_service.py` — Blocking CLI Fallback
@@ -155,8 +159,11 @@ faster-whisper large-v3 downloads automatically on first use (~3GB).
 | `VOICE_BOT_TOKEN` | **Yes** | — | Discord bot token |
 | `DISCORD_GUILD_ID` | No | `0` (auto) | Discord server ID |
 | `DISCORD_AUTO_JOIN_USER` | No | `0` (disabled) | User ID to follow into voice |
-| `VAD_STOP_SECS` | No | `1.5` | Silence duration before processing |
+| `VAD_STOP_SECS` | No | `0.2` (SmartTurn) / `0.8` | Silence duration before processing |
 | `VOICE_LLM_STREAMING` | No | `true` | Use streaming gateway (`true`) or blocking CLI (`false`) |
+| `VOICE_SMART_TURN` | No | `true` | ML-based end-of-turn detection |
+| `VOICE_FILLER_AUDIO` | No | `true` | Play thinking cues while LLM generates |
+| `VOICE_STREAMING_TTS` | No | `true` | Enable streaming TTS via on_frame callback |
 | `OPENCLAW_TOKEN` | No | from config | OpenClaw gateway auth token |
 
 ### Running
@@ -241,15 +248,26 @@ voice-pipeline/v2/
 
 - **Faster TTFT:** Sonnet or other fast models for voice (current Opus TTFT is 2.7–3.1s)
 - **Streaming TTS:** True token-level TTS via `on_frame` callback (currently generates full sentence then chunks)
-- **SmartTurn VAD:** ML-based turn detection instead of fixed silence threshold
-- **Filler audio:** Play "hmm" / thinking sounds during LLM processing to reduce perceived latency
 - **Multi-user:** Track and attribute multiple speakers in a voice channel
+
+## Deployment
+
+### systemd Service
+
+The voice bot runs as a systemd user service (`voice-pipeline.service`) with `Restart=always` so it recovers from crashes and stays alive indefinitely.
+
+The pipeline uses `idle_timeout_secs=None` to prevent Pipecat from killing the pipeline after periods of inactivity between voice calls. Join/leave is managed via Discord events, not pipeline lifecycle.
+
+### VRAM Sharing
+
+The voice pipeline uses ~8GB VRAM (Whisper + Kyutai TTS). On a 16GB GPU, this doesn't leave room for other GPU-heavy workloads (e.g., Marker OCR). Stop the voice bot before running other GPU tasks, or vice versa.
 
 ## Known Issues
 
 1. **First TTS request is slow (~5s)** — Kyutai model loads on first request. Subsequent requests are fast.
 2. **"Audio not received" warnings** — Normal when the voice channel is quiet. Pipecat warns about audio timeouts but continues working.
 3. **int8 compute type crashes** — Blackwell GPU compatibility issue. Use float16.
+4. **VAD cuts off mid-sentence** — The VAD can trigger on natural pauses within a sentence. Speaking without pauses helps. SmartTurn mitigates this with ML-based turn prediction.
 
 ## License
 

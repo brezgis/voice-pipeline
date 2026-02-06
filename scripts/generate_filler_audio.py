@@ -9,7 +9,7 @@ int16 files at 24kHz mono in filler_audio/.
 Run once at setup, or automatically on voice bot startup if clips don't exist.
 
 Usage:
-    cd /home/anna/clawd/voice-pipeline/v2
+    cd voice-pipeline/v2
     source venv/bin/activate
     python scripts/generate_filler_audio.py
 """
