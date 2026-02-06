@@ -48,7 +48,7 @@ DEFAULT_VOICE_HINT = (
 )
 
 # Transcript output directory (daily files: voice-YYYY-MM-DD.md)
-TRANSCRIPT_DIR = Path("/home/anna/clawd/voice-pipeline/v2/transcripts")
+TRANSCRIPT_DIR = Path(__file__).resolve().parent.parent / "transcripts"
 
 # Gateway endpoint
 DEFAULT_GATEWAY_URL = "http://localhost:18789/v1/chat/completions"
@@ -294,9 +294,9 @@ class StreamingGatewayLLMService(AIService):
 
         Format matches v1 transcripts:
             ### HH:MM:SS
-            **Anna (voice):** user text
+            **User (voice):** user text
 
-            **Claude (voice):** response text
+            **Bot (voice):** response text
 
             _Response: 4.9s_
         """
@@ -315,8 +315,8 @@ class StreamingGatewayLLMService(AIService):
 
             entry = (
                 f"### {now.strftime('%H:%M:%S')}\n"
-                f"**Anna (voice):** {user_text}\n\n"
-                f"**Claude (voice):** {response_text}\n\n"
+                f"**User (voice):** {user_text}\n\n"
+                f"**Bot (voice):** {response_text}\n\n"
                 f"_Response: {think_seconds:.1f}s_\n\n"
             )
 

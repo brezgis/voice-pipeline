@@ -40,7 +40,7 @@ DEFAULT_VOICE_HINT = (
 )
 
 # Transcript output directory (daily files: voice-YYYY-MM-DD.md)
-TRANSCRIPT_DIR = Path("/home/anna/clawd/voice-pipeline/v2/transcripts")
+TRANSCRIPT_DIR = Path(__file__).resolve().parent.parent / "transcripts"
 
 
 class ClawdbotLLMService(AIService):
@@ -105,9 +105,9 @@ class ClawdbotLLMService(AIService):
 
         Format matches v1 transcripts:
             ### HH:MM:SS
-            **Anna (voice):** user text
+            **User (voice):** user text
 
-            **Claude (voice):** response text
+            **Bot (voice):** response text
 
             _Think: 4.9s_
         """
@@ -126,8 +126,8 @@ class ClawdbotLLMService(AIService):
 
             entry = (
                 f"### {now.strftime('%H:%M:%S')}\n"
-                f"**Anna (voice):** {user_text}\n\n"
-                f"**Claude (voice):** {response_text}\n\n"
+                f"**User (voice):** {user_text}\n\n"
+                f"**Bot (voice):** {response_text}\n\n"
                 f"_Think: {think_seconds:.1f}s_\n\n"
             )
 

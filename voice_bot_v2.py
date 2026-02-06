@@ -19,7 +19,7 @@ Usage:
 
 Configuration (environment variables):
   VOICE_BOT_TOKEN      - Discord bot token (required)
-  DISCORD_GUILD_ID     - Server ID (default: your server)
+  DISCORD_GUILD_ID     - Server ID (default: 0, auto-detect)
   DISCORD_AUTO_JOIN_USER - User ID to follow into voice (default: unset)
   VAD_STOP_SECS        - Silence duration before processing (default: 1.5)
 """
