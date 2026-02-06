@@ -18,10 +18,12 @@ Usage:
   python voice_bot_v2.py
 
 Configuration (environment variables):
-  VOICE_BOT_TOKEN      - Discord bot token (required)
-  DISCORD_GUILD_ID     - Server ID (default: 0, auto-detect)
+  VOICE_BOT_TOKEN        - Discord bot token (required)
+  DISCORD_GUILD_ID       - Server ID (default: 0, auto-detect)
   DISCORD_AUTO_JOIN_USER - User ID to follow into voice (default: unset)
-  VAD_STOP_SECS        - Silence duration before processing (default: 1.5)
+  VAD_STOP_SECS          - Silence duration before processing (default: 0.8, or 0.2 with SmartTurn)
+  VOICE_SMART_TURN       - Enable ML-based turn detection (default: true)
+  VOICE_STREAMING_TTS    - Enable streaming TTS via on_frame callback (default: true)
 """
 
 import asyncio
@@ -66,11 +68,18 @@ AUTO_JOIN_USER_ID = int(os.getenv("DISCORD_AUTO_JOIN_USER", "0"))
 PIPELINE_SAMPLE_RATE_IN = 16000
 PIPELINE_SAMPLE_RATE_OUT = 24000  # Kyutai TTS outputs 24kHz
 
+# SmartTurn: ML-based end-of-turn detection (pipecat 0.0.101+)
+# When enabled, reduces VAD_STOP_SECS to 0.2 since SmartTurn handles
+# intelligent end-of-turn prediction, saving ~600ms per turn.
+USE_SMART_TURN = os.getenv("VOICE_SMART_TURN", "true").lower() in ("true", "1", "yes")
+
 # VAD settings — how long to wait after speech stops before processing
-# Higher = fewer cut-offs, but slower response time
+# With SmartTurn: 0.2s (SmartTurn ML model predicts turn boundaries)
+# Without SmartTurn: 0.8s (pure silence-based, conservative default)
 VAD_CONFIDENCE = 0.7
 VAD_START_SECS = 0.2  # How long speech must last to trigger
-VAD_STOP_SECS = float(os.getenv("VAD_STOP_SECS", "1.5"))  # Silence before processing
+_DEFAULT_STOP_SECS = "0.2" if USE_SMART_TURN else "0.8"
+VAD_STOP_SECS = float(os.getenv("VAD_STOP_SECS", _DEFAULT_STOP_SECS))
 VAD_MIN_VOLUME = 0.6
 
 
@@ -89,6 +98,8 @@ async def main():
     logger.info(f"Guild ID: {GUILD_ID}")
     logger.info(f"Auto-join user: {AUTO_JOIN_USER_ID}")
     logger.info(f"VAD stop seconds: {VAD_STOP_SECS}")
+    logger.info(f"SmartTurn: {USE_SMART_TURN}")
+    logger.info(f"Streaming TTS: {os.getenv('VOICE_STREAMING_TTS', 'true')}")
     logger.info(f"LLM mode: {llm_mode}")
 
     # --- Check prerequisites ---
@@ -105,11 +116,46 @@ async def main():
         logger.error("PyTorch not installed")
         sys.exit(1)
 
+    # --- SmartTurn: ML-based end-of-turn detection ---
+    turn_analyzer = None
+    if USE_SMART_TURN:
+        try:
+            from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
+            from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
+
+            smart_turn_params = SmartTurnParams(
+                stop_secs=3.0,       # Max silence before forced end-of-turn
+                pre_speech_ms=500,   # Audio context before speech onset
+            )
+            turn_analyzer = LocalSmartTurnAnalyzerV3(params=smart_turn_params)
+            logger.info("SmartTurn v3 (ONNX) loaded — ML-based turn detection active")
+        except Exception as e:
+            logger.warning(f"SmartTurn not available, falling back to silence-only VAD: {e}")
+            turn_analyzer = None
+
     # --- Create transport ---
+    # Pass turn_analyzer through TransportParams if SmartTurn is available.
+    # Note: turn_analyzer on TransportParams is deprecated in pipecat 0.0.101+
+    # in favor of LLMUserAggregator with TurnAnalyzerUserTurnStopStrategy.
+    # TODO: Migrate to LLMUserAggregator when we refactor the pipeline architecture.
+    transport_params = None
+    if turn_analyzer:
+        from pipecat.transports.base_transport import TransportParams
+        transport_params = TransportParams(
+            audio_in_enabled=True,
+            audio_in_sample_rate=PIPELINE_SAMPLE_RATE_IN,
+            audio_in_channels=1,
+            audio_out_enabled=True,
+            audio_out_sample_rate=PIPELINE_SAMPLE_RATE_IN,
+            audio_out_channels=1,
+            turn_analyzer=turn_analyzer,
+        )
+
     transport = DiscordTransport(
         bot_token=bot_token,
         guild_id=GUILD_ID,
         auto_join_user_id=AUTO_JOIN_USER_ID,
+        params=transport_params,
     )
 
     # --- Create pipeline processors ---
