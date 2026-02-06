@@ -24,6 +24,7 @@ Configuration (environment variables):
   VAD_STOP_SECS          - Silence duration before processing (default: 0.8, or 0.2 with SmartTurn)
   VOICE_SMART_TURN       - Enable ML-based turn detection (default: true)
   VOICE_STREAMING_TTS    - Enable streaming TTS via on_frame callback (default: true)
+  VOICE_FILLER_AUDIO     - Play filler audio cue while LLM thinks (default: true)
 """
 
 import asyncio
@@ -48,6 +49,7 @@ from pipecat.services.whisper.stt import WhisperSTTService
 # Our custom components
 from discord_transport import DiscordTransport
 from kyutai_tts_service import KyutaiTTSService
+from filler_audio_processor import FillerAudioProcessor
 
 # LLM service: streaming gateway (default) or blocking CLI fallback
 USE_STREAMING_LLM = os.getenv("VOICE_LLM_STREAMING", "true").lower() in ("true", "1", "yes")
@@ -72,6 +74,9 @@ PIPELINE_SAMPLE_RATE_OUT = 24000  # Kyutai TTS outputs 24kHz
 # When enabled, reduces VAD_STOP_SECS to 0.2 since SmartTurn handles
 # intelligent end-of-turn prediction, saving ~600ms per turn.
 USE_SMART_TURN = os.getenv("VOICE_SMART_TURN", "true").lower() in ("true", "1", "yes")
+
+# Filler audio: play a brief audio cue ("Hmm.", "Okay.") while LLM is thinking
+USE_FILLER_AUDIO = os.getenv("VOICE_FILLER_AUDIO", "true").lower() in ("true", "1", "yes")
 
 # VAD settings — how long to wait after speech stops before processing
 # With SmartTurn: 0.2s (SmartTurn ML model predicts turn boundaries)
@@ -100,6 +105,7 @@ async def main():
     logger.info(f"VAD stop seconds: {VAD_STOP_SECS}")
     logger.info(f"SmartTurn: {USE_SMART_TURN}")
     logger.info(f"Streaming TTS: {os.getenv('VOICE_STREAMING_TTS', 'true')}")
+    logger.info(f"Filler audio: {USE_FILLER_AUDIO}")
     logger.info(f"LLM mode: {llm_mode}")
 
     # --- Check prerequisites ---
@@ -187,15 +193,42 @@ async def main():
     # TTS: Kyutai TTS 1.6B
     tts = KyutaiTTSService(n_q=8, device="cuda")
 
+    # Filler audio: thinking cue played while LLM generates
+    filler = None
+    if USE_FILLER_AUDIO:
+        filler_dir = Path(__file__).parent / "filler_audio"
+        manifest = filler_dir / "manifest.txt"
+        if not manifest.exists():
+            logger.info("Filler audio clips not found — generating with Kyutai TTS...")
+            try:
+                import subprocess
+                result = subprocess.run(
+                    [sys.executable, str(Path(__file__).parent / "scripts" / "generate_filler_audio.py")],
+                    capture_output=True, text=True, timeout=120,
+                )
+                if result.returncode != 0:
+                    logger.error(f"Filler audio generation failed:\n{result.stderr}")
+                else:
+                    logger.info("Filler audio clips generated successfully")
+            except Exception as e:
+                logger.error(f"Failed to generate filler audio: {e}")
+
+        filler = FillerAudioProcessor(enabled=USE_FILLER_AUDIO)
+
     # --- Build pipeline ---
-    pipeline = Pipeline([
+    processors = [
         transport.input(),   # DiscordInputTransport
         vad,                 # VADProcessor
         stt,                 # WhisperSTTService
-        llm,                 # ClawdbotLLMService
+    ]
+    if filler:
+        processors.append(filler)  # FillerAudioProcessor (between STT and LLM)
+    processors.extend([
+        llm,                 # ClawdbotLLMService / StreamingGatewayLLMService
         tts,                 # KyutaiTTSService
         transport.output(),  # DiscordOutputTransport
     ])
+    pipeline = Pipeline(processors)
 
     # --- Create task ---
     params = PipelineParams(

@@ -20,6 +20,10 @@ models/
 *.mp3
 *.ogg
 *.flac
+*.pcm
+
+# Generated filler audio clips (re-generate with scripts/generate_filler_audio.py)
+filler_audio/
 
 # Logs
 logs/
