@@ -269,6 +269,10 @@ The voice pipeline uses ~8GB VRAM (Whisper + Kyutai TTS). On a 16GB GPU, this do
 3. **int8 compute type crashes** — Blackwell GPU compatibility issue. Use float16.
 4. **VAD cuts off mid-sentence** — The VAD can trigger on natural pauses within a sentence. Speaking without pauses helps. SmartTurn mitigates this with ML-based turn prediction.
 
+## Made by
+
+Anna Brezgis and Claude — [brezgis.com](https://brezgis.com)
+
 ## License
 
 MIT
